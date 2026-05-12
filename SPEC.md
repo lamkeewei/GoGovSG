@@ -12,7 +12,7 @@ The document uses RFC 2119 keywords (`MUST`, `SHOULD`, `MAY`, `MUST NOT`) when s
 2. Goals and Non-Goals
 3. System Overview
 4. Core Domain Model
-5. Asset Variants
+5. Deployment Branding
 6. Configuration Specification
 7. Identifiers, Validation, and Constants
 8. Authentication and Session Management
@@ -64,12 +64,12 @@ The system also serves as a controlled file-hosting endpoint, so officers can pu
 - Permit authenticated users from whitelisted email domains to create, edit, transfer, deactivate, and inspect short URLs and short links to uploaded files.
 - Provide a fast, cached redirect path that detects malicious destinations at redirect time and refuses to send users to known threats.
 - Provide bulk creation of short URLs from a CSV file, optionally accompanied by asynchronously generated QR codes.
-- Provide single-click QR code generation in SVG, PNG, and JPEG formats, branded per asset variant.
+- Provide single-click QR code generation in SVG, PNG, and JPEG formats, with a configurable brand logo and accent color.
 - Provide per-link click statistics broken down by date, weekday-hour, and device class.
 - Provide a public, searchable directory of short links so citizens can verify a link's authenticity before clicking.
 - Provide a programmatic REST API for officers who wish to integrate the shortener with their own systems, plus a privileged admin API for provisioning links on behalf of other officers.
 - Provide a complete, append-only audit trail of every change to every link.
-- Run as three independently brandable deployments (`gov`, `edu`, `health`) from a single codebase, each with its own short-URL prefix, allowed email domain, and styling.
+- Run as a single deployment, with the public name, short-URL hostname, file-hosting hostname, allowed email domain, and copy supplied through runtime configuration.
 
 ### 2.2 Non-Goals
 
@@ -78,7 +78,7 @@ The system also serves as a controlled file-hosting endpoint, so officers can pu
 - The system does not support arbitrary file MIME types. Allowed file extensions are a fixed allowlist.
 - The system does not store unhashed OTPs or API keys. Compromised secrets can only be rotated, not recovered.
 - The system does not throttle redirects. The redirect path is intended to be the highest-throughput surface.
-- The system does not implement custom internationalization. Only English is supported; the three asset variants differ in copy, not language.
+- The system does not implement custom internationalization. Only English is supported.
 
 ---
 
@@ -224,26 +224,20 @@ Not a SQL entity but a first-class object. Key: `${email}:${ip}`. Value: `{ hash
 
 ---
 
-## 5. Asset Variants
+## 5. Deployment Branding
 
-The system ships in three brand variants, selected at build time by `ASSET_VARIANT`:
+The system runs as a single deployment. Its public identity (name, hostnames, allowed email domain, on-page copy, QR-code styling) is supplied through runtime configuration rather than being hardwired in source.
 
-| Variant | Public name | Short-URL prefix | Email allowlist (example) |
-|---------|-------------|------------------|---------------------------|
-| `gov` | Go.gov.sg | `go.gov.sg/` | `*.gov.sg` |
-| `edu` | For.edu.sg | `for.edu.sg/` | `*.edu.sg` |
-| `health` | For.sg | `for.sg/` | healthcare domains |
+The configurable identity surface consists of:
 
-Variants differ only in:
+- **`OG_URL`** — the canonical origin URL (e.g., `https://go.gov.sg`). Used for circular-redirect prevention, trusted-referrer detection, and as the basis for constructing the full short link in QR codes.
+- **`VALID_EMAIL_GLOB_EXPRESSION`** — the email-domain allowlist (e.g., `*.gov.sg`).
+- **`AWS_S3_BUCKET`** — the file-hosting bucket name. In production this is also the hostname of the file-serving domain (e.g., `file.go.gov.sg`), making the canonical file URL `https://${AWS_S3_BUCKET}/${shortUrl}.${ext}`. See §11.
+- **Display name** — the human-readable service name (e.g., "Go.gov.sg") returned in API responses and shown in templated HTML (transition page, 404 page).
+- **Locale strings** — the single English copy bundle loaded by the client (§18.9, Appendix D).
+- **QR-code brand color and logo** — the dark color used when rendering QR codes (§14) and the centered logo overlay.
 
-- The HTML entry document used by Webpack (`public/index-{variant}.html`).
-- Locale JSON under `public/locales/{variant}/en/translation.json`.
-- Static assets under `public/assets/{variant}/` and `src/client/app/assets/{variant}/`.
-- QR-code logo and accent color (per §14.3).
-- Allowed email-domain glob (provided at runtime by `VALID_EMAIL_GLOB_EXPRESSION`).
-- Display hostname returned in API responses (mapped in `displayHostnameMap`).
-
-Variants share all server code, all data models, and all API contracts. A conforming implementation MUST be able to switch variants by changing build-time and run-time configuration alone, without source modification.
+A reimplementation that needs only one deployment MAY hard-code these values as long as the External REST API contract (§27.4) and the file URL shape (§27.3) remain configurable through deployment, since they affect URLs already in the wild.
 
 ---
 
@@ -267,7 +261,7 @@ Configuration is supplied via environment variables. The application MUST valida
 | `VALID_EMAIL_GLOB_EXPRESSION` | Glob pattern allowed by minimatch with `{ noext: false, noglobstar: true, nobrace: true, nonegate: true }`. |
 | `AWS_S3_BUCKET` | Bucket name for file uploads. |
 | `API_KEY_SALT` | Bcrypt salt used to hash API key suffixes. |
-| `ASSET_VARIANT` | `gov` \| `edu` \| `health`. |
+| Display name | Human-readable service name shown in templated HTML and returned in some API responses. Implementation-defined (env var or build-time constant). |
 
 ### 6.2 Production-only Required Variables
 
@@ -406,7 +400,7 @@ Server behavior:
 2. Generate a 6-digit numeric OTP using cryptographic randomness.
 3. Hash the OTP with bcrypt using `SALT_ROUNDS`.
 4. Store `{ hashedOtp, retries: 3 }` in the OTP Redis at key `${email}:${ip}` with TTL `OTP_EXPIRY`.
-5. Send the unhashed OTP to the supplied email through the configured mailer (SES in production, MailDev in development, Postman as optional fallback). The email body MUST include the OTP, the requester's IP, and the asset-variant display name.
+5. Send the unhashed OTP to the supplied email through the configured mailer (SES in production, MailDev in development, Postman as optional fallback). The email body MUST include the OTP, the requester's IP, and the deployment's display name.
 6. On success, return `200 { message: "OTP generated and sent." }` and increment `OTP_GENERATE_SUCCESS`. On mailer failure, increment `OTP_GENERATE_FAILURE` and return 500.
 
 **`POST /api/login/verify`** — verifies an OTP.
@@ -672,7 +666,7 @@ Files attached to short URLs are stored on S3 in `AWS_S3_BUCKET`:
 - Object key: `${shortUrl}.${ext}`.
 - ACL: public-read when `state = ACTIVE`, private when `state = INACTIVE`. Cache-Control on uploaded objects is `no-cache`.
 - `longUrl` for a file URL MUST be constructed as `${fileURLPrefix}${AWS_S3_BUCKET}/${key}`.
-  - In production, `fileURLPrefix = 'https://'`, so the URL is `https://${AWS_S3_BUCKET}/${shortUrl}.${ext}`. Production deployments customarily set `AWS_S3_BUCKET = file.go.gov.sg` (or `file-staging.go.gov.sg`, `file.for.edu.sg`, etc.), making the canonical file URL `https://file.go.gov.sg/${shortUrl}.${ext}`. **External integrators and stored history MAY depend on this URL shape; it MUST be preserved.**
+  - In production, `fileURLPrefix = 'https://'`, so the URL is `https://${AWS_S3_BUCKET}/${shortUrl}.${ext}`. The bucket name is conventionally also the public hostname (e.g., `file.go.gov.sg`), making the canonical file URL `https://${FILE_HOSTNAME}/${shortUrl}.${ext}`. **External integrators and stored history depend on this URL shape; see §27.3.**
   - In development, `fileURLPrefix` is the LocalStack `ACCESS_ENDPOINT` followed by `/`.
 - The reverse derivation `getKeyFromLongUrl(longUrl)` MUST extract the key as the final path segment.
 - Files MUST pass the extension/MIME and antivirus checks of §12.2 before upload.
@@ -874,11 +868,11 @@ Behavior:
 2. Construct the full URL `${OG_URL}/${shortUrl}`.
 3. Render with the `qrcode` library:
    - SVG output, error correction level `H`, margin 0.
-   - Dark color from the asset-variant color map (§14.3).
+   - Dark color from the deployment's brand color (§14.3).
 4. Compose onto a 1000-pixel-wide canvas:
    - 85 px top margin.
    - 800×800 QR centered.
-   - The variant logo (`qrlogo-${ASSET_VARIANT}.svg`) overlaid at center.
+   - A configurable brand logo SVG overlaid at the center of the QR.
    - 85 px between QR and text.
    - Text: the human-readable short link (e.g., `go.gov.sg/foo`) in IBM Plex Sans 32 px, line height 1.35, anchor middle, wrapped every 36 characters.
    - 85 px bottom margin after final line.
@@ -895,25 +889,9 @@ For each `jobItemId = "${job.uuid}/${i}"`, the Lambda produces three S3 objects:
 - `${jobItemId}/generated_svg.zip` — `${shortUrl}.svg` per mapping.
 - `${jobItemId}/generated_png.zip` — `${shortUrl}.png` per mapping.
 
-### 14.3 Color and Logo per Variant
+### 14.3 Color and Logo
 
-QR dark color, server-side:
-
-| Variant | Color |
-|---------|-------|
-| `gov` | `#384A51` |
-| `edu` | `#000000` |
-| `health` | `#000000` |
-
-QR dark color, Lambda-side (uses the brand accent rather than near-black):
-
-| Variant | Color |
-|---------|-------|
-| `gov` | `#384A51` |
-| `edu` | `#2B2E4A` |
-| `health` | `#472F40` |
-
-A conforming implementation MAY unify these but MUST document the choice. Logo assets live in `src/server/modules/qr/assets/` and the Lambda's `assets/` directory.
+QR codes MUST be rendered with a single brand dark color and a single brand logo, both implementation-defined. The chosen color and logo are deployment-wide constants. Both the synchronous QR-code endpoint (§14.1) and the bulk-generation Lambda (§14.2, Appendix A.3) MUST use the same color and logo so that a single QR rendered ad hoc is visually indistinguishable from one rendered as part of a bulk job.
 
 ---
 
@@ -1267,7 +1245,7 @@ All requests MUST include `credentials: 'include'` and `mode: 'same-origin'`.
 
 ### 18.9 Internationalization
 
-i18next is initialized with HTTP backend `loadPath = '/locales/{ASSET_VARIANT}/{{lng}}/{{ns}}.json'`. Default and fallback `lng` is `en`. `whitelist` is `['en']`. `interpolation.escapeValue` MUST be `false` (React handles XSS escaping). The locale schema is in Appendix D.
+The client loads a single English locale bundle via i18next at startup. The loader path is implementation-defined (the existing implementation uses `/locales/en/{{ns}}.json`). Default and fallback `lng` is `en`, `whitelist` is `['en']`, `interpolation.escapeValue` MUST be `false` (React handles XSS escaping). The locale schema is in Appendix D.
 
 ---
 
@@ -1363,7 +1341,7 @@ The redirect cache MUST be invalidated on `Url` update.
 
 - `dd-trace` initialized with `profiling: true, logInjection: true, runtimeMetrics: true`.
 - HTTP integration sets `resource.name = "${method} ${host}${path}"`.
-- Identified by `DD_SERVICE` (`go-gov`/`go-edu`/`go-health`) and `DD_ENV`.
+- Identified by `DD_SERVICE` (deployment-specific service name) and `DD_ENV`.
 
 ### 22.3 Datadog RUM (client)
 
@@ -1606,7 +1584,7 @@ Chrome headless against `npm run dev`. MUST cover the user stories of §3 (login
 
 ### 25.4 Continuous Integration
 
-Lint + lockfile audit + unit + e2e + integration MUST run on every push and pull request. Production deploys are triggered by GitHub Release and fan out to three asset variants in parallel.
+Lint + lockfile audit + unit + e2e + integration MUST run on every push and pull request. Production deploys are triggered by GitHub Release.
 
 ---
 
@@ -1635,7 +1613,6 @@ Lint + lockfile audit + unit + e2e + integration MUST run on every push and pull
 
 - [ ] Datadog APM, RUM, and StatsD wired up.
 - [ ] LocalStack-based local development via `npm run dev`.
-- [ ] Three-variant build pipeline in CI with matrix of `gov`/`edu`/`health`.
 - [ ] Serverless deploy of the four Lambdas in Appendix A.
 
 ### 26.3 Operational validation
@@ -1664,7 +1641,7 @@ Everything else — the SPA-facing `/api/*` routes (login, user, qrcode, link-st
 
 ### 27.2 Redirect endpoint (external)
 
-`GET /{shortUrl}` MUST continue to be served at the production origin (`go.gov.sg`, `for.edu.sg`, `for.sg`).
+`GET /{shortUrl}` MUST continue to be served at the deployment's production origin (configured via `OG_URL`, e.g. `https://go.gov.sg`).
 
 Required behaviors:
 
@@ -1693,7 +1670,7 @@ When a short link points to a hosted file, its `longUrl` MUST take the form:
 https://{FILE_HOSTNAME}/{shortUrl}.{ext}
 ```
 
-where `FILE_HOSTNAME` is the public file-serving hostname for the variant (canonically `file.go.gov.sg`, `file.for.edu.sg`, `file.for.sg`). This URL is what citizens see, what gets shared in messages, and what is stored in `urls.longUrl` for every file-backed short link issued to date.
+where `FILE_HOSTNAME` is the public file-serving hostname of the deployment (e.g., `file.go.gov.sg`). This URL is what citizens see, what gets shared in messages, and what is stored in `urls.longUrl` for every file-backed short link issued to date.
 
 Required behaviors:
 
@@ -1749,7 +1726,7 @@ The following are part of the rewrite's own design surface and MAY change freely
 | Cookie names (`gogovsg`, `visits`) | Session cookies are reissued on next login; the visits cookie at worst causes one extra transition-page display. |
 | Session-store technology (`connect-redis` layout) | A rewrite may use any session backend. |
 | `GET /assets/transition-page/js/redirect.js` | An implementation detail of the transition page; if the rewrite renders the transition page differently, this route can disappear. |
-| Locale loader path `/locales/{variant}/en/...` | Tied to the SPA's i18next configuration. |
+| Locale loader path (`/locales/...`) | Tied to the SPA's i18next configuration. |
 | The `hasApiKey` stringly-typed `'true'/'false'` response | SPA-only; safe to replace with a boolean. |
 | The Joi-on-body validator over `GET /api/user/url` that reads from `req.query` | SPA-only quirk. |
 | Internal headers like `Cache-Control: no-store` | A rewrite may apply different caching policies. |
@@ -1802,7 +1779,7 @@ Handler: `src/server/serverless/bulk-qrcode-generation/index.handler`. Memory: 2
 
 Triggered by SQS messages of the form `{ jobItemId, mappings: [{shortUrl, longUrl}, …] }`.
 
-Environment: `ASSET_VARIANT`, `DOMAIN`, `BULK_GENERATION_BUCKET`, `EB_CALLBACK_ENDPOINT`, `EB_CALLBACK_SECRET`.
+Environment: `DOMAIN` (used to build the human-readable short link encoded in each QR), `BULK_GENERATION_BUCKET`, `EB_CALLBACK_ENDPOINT`, `EB_CALLBACK_SECRET`.
 
 Steps:
 
@@ -1870,7 +1847,7 @@ All metrics MUST be prefixed `go.`.
 
 ## Appendix D. Locale Schema
 
-Each variant ships exactly one locale file at `public/locales/{variant}/en/translation.json`. The key schema MUST be:
+The deployment ships exactly one English locale file. Its location is implementation-defined (the existing implementation places it under `public/locales/en/translation.json` and loads it via i18next). The key schema MUST be:
 
 ```
 general:
@@ -1906,7 +1883,7 @@ login:
     email              string
 ```
 
-i18next is initialized with `lng: 'en'`, `fallbackLng: 'en'`, `whitelist: ['en']`, `interpolation.escapeValue: false` (React escapes separately). The asset variant for the loader path is injected at build time as `process.env.ASSET_VARIANT`.
+i18next is initialized with `lng: 'en'`, `fallbackLng: 'en'`, `whitelist: ['en']`, `interpolation.escapeValue: false` (React escapes separately).
 
 ---
 
@@ -1952,7 +1929,7 @@ Columns:
 | `GET` | `/api/directory/search` | S | I | §17 |
 | `POST` | `/api/callback/qr` | K + A | I | §13.4 |
 | `GET` | `/assets/transition-page/js/redirect.js` | – | I | §10.1 |
-| `GET` | `/locales/:variant/en/translation.json` | – | I | §18.9 |
+| `GET` | `/locales/en/translation.json` (or implementation-defined path) | – | I | §18.9 |
 
 A rewrite that wishes to remain compatible with deployed links and existing API integrations need only preserve the **E**-class rows of this table (plus the file URL shape of §27.3 and the API key verification rules of §27.5). All **I**-class rows may be redesigned, removed, or replaced; the SPA must be updated in lockstep.
 
