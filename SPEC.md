@@ -34,7 +34,7 @@ The document uses RFC 2119 keywords (`MUST`, `SHOULD`, `MAY`, `MUST NOT`) when s
 24. Reference Algorithms
 25. Test and Validation Matrix
 26. Implementation Checklist
-27. Backward Compatibility Invariants
+27. Backward Compatibility (External Surfaces Only)
 
 Appendix A. Serverless Functions
 Appendix B. Validation Rules Reference
@@ -544,7 +544,9 @@ There is no explicit user-facing delete. Setting `state = INACTIVE` removes the 
 
 ### 9.5 Listing (`GET /api/user/url`)
 
-Parameters MUST be supplied as **query string parameters** (`req.query`). The route-level Joi validator targets `req.body` in the existing implementation, but the controller extracts conditions from `req.query` with default fallbacks. A conforming implementation MUST honor both call shapes — query parameters MUST be authoritative; a non-empty JSON body MUST NOT alter behavior. This duality is fixed for backward compatibility with existing clients.
+This endpoint is consumed only by the SPA (§18.5). It is **not** part of the External REST API and MAY be redesigned during a rewrite (see §27.6). The shape below describes the current implementation.
+
+Parameters are read from the query string. (The existing implementation also declares a body-level Joi validator with default fallbacks; the controller extracts conditions from `req.query`. A reimplementation is free to drop the body schema and accept query parameters exclusively.)
 
 ```
 limit?:         int 0..1000 (default 1000)
@@ -582,13 +584,18 @@ When a write supplies tags, the server MUST:
 
 ### 10.1 Request Path
 
-Route: `GET /:shortUrl([a-zA-Z0-9-]+).?`. The Express path regex MUST match `[a-zA-Z0-9-]+` followed by an *optional* trailing single character. The trailing `.?` is load-bearing: legacy SMS clients and email clients append a sentence-terminating dot, and the production system MUST resolve `https://go.gov.sg/foo.` to the same short URL as `https://go.gov.sg/foo`.
+Route: `GET /:shortUrl`. The endpoint accepts a short URL slug matching `[a-zA-Z0-9-]+`.
 
-The router parameter MUST be looked up case-insensitively. Implementations MUST `toLowerCase()` the captured short URL before consulting the redirect cache or the database; otherwise return 404 immediately. Stored `shortUrl` values are effectively lowercase (creation paths enforce this through the validation regex `/^[a-z0-9-]+$/` on the client; the server still accepts `[a-zA-Z0-9-]+` at the boundary).
+Two behaviors of this endpoint are **externally binding** because they affect resolution of links already published in the wild (see §27.2):
 
-Middleware MUST include `cookieSession` for the `visits` cookie. Helmet headers and morgan logging apply.
+- **Trailing-character tolerance**: the captured slug MAY be followed by a single trailing non-slug character (e.g., a `.` appended by an SMS or email client). `/foo.` MUST resolve to the same short URL as `/foo`. The existing implementation expresses this as the Express path regex `/:shortUrl([a-zA-Z0-9-]+).?`; a rewrite may parse the path differently as long as the behavior is preserved.
+- **Case-insensitive lookup**: `/Foo`, `/FOO`, and `/foo` MUST resolve identically. The existing implementation lowercases the captured slug before cache and database lookup. Stored `shortUrl` values in the canonical deployment are effectively lowercase.
 
-In addition, the server MUST serve **`GET /assets/transition-page/js/redirect.js`**: a server-rendered JavaScript file (template `redirect.ejs`) returned with `Content-Type: text/javascript`. The template MUST be parameterized with `gaTrackingId`, `EventCategory.TRANSITION_PAGE`, and `EventAction.LOADED` / `EventAction.PROCEEDED` so that the transition page can fire `loaded` and `proceeded` GA events without inlining the tracking ID into the HTML.
+Everything else in this section describes the current implementation; rewrites may diverge.
+
+The redirect handler renders the transition page from a server-side template. The current implementation loads its in-page JavaScript from a separate route — `GET /assets/transition-page/js/redirect.js` (a server-rendered `text/javascript` response built from the `redirect.ejs` template, parameterized with `gaTrackingId`, `EventCategory.TRANSITION_PAGE`, `EventAction.LOADED`, and `EventAction.PROCEEDED`). This indirection exists because the GA tracking ID is a runtime environment variable. A reimplementation that inlines the script, or uses a different transition page entirely, is acceptable; this auxiliary route is not part of the external contract.
+
+Middleware in the current implementation includes `cookieSession` for the `visits` cookie (used to suppress the transition page on repeat visits). The cookie name is an implementation detail; a rewrite may use a different mechanism or no mechanism at all.
 
 ### 10.2 Resolution Algorithm
 
@@ -1420,11 +1427,11 @@ errorHandler(err, req, res, next):
     res.status(500).render('500.error.ejs')
 ```
 
-There are **three** not-found surfaces, each MUST be preserved:
+There are three not-found surfaces. Only one is part of the external contract (§27):
 
-1. **`/api/v1/...` 404** — JSON body `{ message: 'Resource not found.' }` (the v1 router declares its own fallback).
-2. **`/api/...` 404** — renders the same EJS template as the main 404 (`ERROR_404_PATH`) with the variant context. Yes, the main API router renders HTML on unknown paths; integrators MUST treat any non-2xx response from a non-JSON endpoint with `Content-Type` sniffing.
-3. **Top-level 404** — for any path that is neither `/api/...`, an asset, nor a valid short URL: render `ERROR_404_PATH` with `shortUrl = req.path.slice(1)`, `assetVariant`, and `displayHostname`. The same template is used for "short URL not found", "short URL invalid characters", and "short URL deactivated".
+1. **External REST API 404 (`/api/v1/...`)** — JSON body, e.g., `{ message: 'Resource not found.' }`. Integrators rely on the JSON content type; the body schema is implementation-defined.
+2. **Short-URL 404 (`GET /:shortUrl`)** — HTTP 404 from the redirect endpoint. The current implementation renders an HTML "link not found" page; a rewrite may render any HTML or JSON 404, so long as the status code is 404.
+3. **SPA / internal API 404** — any other path. The current implementation renders the same HTML template as surface 2; a rewrite may handle this however it likes.
 
 The process MUST listen for `unhandledRejection` and increment `ERROR_UNHANDLED_REJECTION`.
 
@@ -1611,7 +1618,7 @@ Lint + lockfile audit + unit + e2e + integration MUST run on every push and pull
 - [ ] All required env vars of §6.1 validated at startup with fail-fast.
 - [ ] Email allowlist enforced as the **intersection** of `validator.isEmail` and minimatch with the documented flags.
 - [ ] OTP flow with per-IP rate limit, bcrypt-hashed storage, 3-retry semantics, and Redis TTL.
-- [ ] Session store on Redis with strict same-site cookies named `gogovsg`.
+- [ ] Session store with strict same-site cookies (cookie name is implementation-defined; see §27.6).
 - [ ] API key flow with version-prefixed key strings and bcrypt-hashed suffix storage.
 - [ ] Helmet CSP per §22.5, `Cache-Control: no-store` everywhere.
 - [ ] Short URL CRUD with full URL/file/tag validation, history hooks, and redirect-cache invalidation.
@@ -1640,95 +1647,124 @@ Lint + lockfile audit + unit + e2e + integration MUST run on every push and pull
 
 ---
 
-## 27. Backward Compatibility Invariants
+## 27. Backward Compatibility (External Surfaces Only)
 
-GoGovSG is a long-lived public service. Existing emails, SMSes, printed posters, partner integrations, and downstream automations carry assumptions about its public surface. A conforming implementation MUST preserve the following invariants, even when refactoring internals.
+### 27.1 Scope
 
-### 27.1 Short-link URL shape (HARD compatibility)
+GoGovSG is a long-lived public service, but only a small subset of its HTTP surface is consumed by third parties. A reimplementation MAY freely change everything *except* the surfaces that exist outside the system's own client. This section enumerates the externally-binding surfaces; **anything not listed here is implementation-defined and may be changed without notice.**
 
-- The redirect endpoint MUST resolve `GET /:shortUrl` where `shortUrl ∈ [a-zA-Z0-9-]+`.
-- The endpoint MUST tolerate an **optional trailing single character** (the Express path regex is `/:shortUrl([a-zA-Z0-9-]+).?`). This compensates for clients that concatenate punctuation (e.g., `https://go.gov.sg/foo.`) and MUST continue to resolve such requests successfully.
-- Short-URL lookup at redirect time MUST be **case-insensitive**: the controller `toLowerCase()`s the captured value before cache and database lookup. Implementations that store short URLs with mixed case MUST also lowercase them at write time, or accept a one-way migration to all-lowercase storage.
-- The redirect MUST return **HTTP 302** with `Location: longUrl` when no transition page is shown. The transition-page response MUST be **HTTP 200** rendering the `transition-page.ejs` template at the same URL. Either response is considered "the redirect" by downstream consumers; the distinction is invisible to crawlers.
-- The 404 surface for an unknown short URL MUST be an HTML page (not a JSON 404). Citizens forwarded a stale link see this page; bookmark services rely on this content type to render a preview.
+The externally-binding surfaces are:
 
-### 27.2 File-link URL shape (HARD compatibility)
+1. The **redirect endpoint** at `GET /:shortUrl` — invoked by every link in the wild (SMS, email, posters, QR codes, partner sites, search engines).
+2. The **file URL shape** at `https://{file-hostname}/{shortUrl}.{ext}` — appears as `urls.longUrl` for file-backed short links, republished in user-facing materials.
+3. The **External REST API** at `/api/v1/*` and `/api/v1/admin/*` — designed and documented for third-party integration; gated by `FF_EXTERNAL_API`.
+4. The **API key format and authentication** for the External REST API — integrators have generated keys and store them in their own systems.
 
-- The canonical file URL MUST be `https://${AWS_S3_BUCKET}/${shortUrl}.${ext}`. Production deployments use bucket names that resolve at DNS, producing user-visible URLs like `https://file.go.gov.sg/abc.pdf`. **These URLs are stored as `urls.longUrl` in existing databases and republished in emails, RSS, PDF documents, and external integrations.** Changing the bucket, the prefix, or the key format MUST be done with an explicit migration; the URL shape MUST NOT silently change.
-- The S3 object key MUST be exactly `${shortUrl}.${ext}` (one extension, derived from the file's detected MIME). Re-uploads MUST overwrite this key.
+Everything else — the SPA-facing `/api/*` routes (login, user, qrcode, link-stats, link-audit, directory, callback), cookie names, session storage layout, response envelopes, HTML 404 templates, asset paths, log format, internal headers, the dual query/body parameter source on `GET /api/user/url`, the `hasApiKey` stringly-typed response — is **internal**. A rewrite SHOULD reach functional parity with these surfaces (so the SPA still works), but is free to change paths, methods, request shapes, response shapes, and status semantics. The SPA is part of the rewrite and may be updated in lockstep.
 
-### 27.3 API path stability (HARD compatibility)
+### 27.2 Redirect endpoint (external)
 
-All routes listed in **Appendix E** form the supported public surface. A conforming implementation MUST:
+`GET /{shortUrl}` MUST continue to be served at the production origin (`go.gov.sg`, `for.edu.sg`, `for.sg`).
 
-- Preserve every path, including hyphenation (e.g., `/api/link-stats`, `/api/link-audit`, `/api/login/isLoggedIn`, `/api/login/emaildomains`, `/api/user/hasApiKey`).
-- Preserve the HTTP method on each path (in particular, **ownership transfer is `PATCH /api/user/url/ownership`**, not `POST`; **logout is `GET /api/logout`**, not `POST`).
-- Preserve query-vs-body source for parameters. Existing clients call `GET /api/user/url` with query parameters (the controller reads `req.query`); a conforming implementation MUST accept this and MUST NOT require a request body.
-- Preserve the URL parameter `:shortUrl` of `PATCH /api/v1/urls/:shortUrl` as a path segment, not a body field. The server lifts it into the request body internally via the `preprocessShortUrl` middleware.
+Required behaviors:
 
-### 27.4 Response shape (HARD compatibility)
+- **Path grammar**: `shortUrl ∈ [a-zA-Z0-9-]+`. A reimplementation MUST resolve every previously-issued short URL whose slug satisfies this grammar.
+- **Trailing-character tolerance**: requests of the form `/{shortUrl}.` (or with one trailing non-slug character) MUST resolve to the same short URL. SMSes and email clients commonly append sentence terminators to the URL.
+- **Case-insensitive lookup**: `/Foo`, `/FOO`, and `/foo` MUST resolve identically. The slug grammar accepts uppercase, but no two short URLs ever differed only by case in the canonical deployment.
+- **Successful resolution**: respond with either:
+  - HTTP 302 with `Location: <longUrl>` (direct redirect), or
+  - HTTP 200 with an HTML page that navigates the user to `longUrl` after a short delay (the "transition page").
+  - The choice between the two is implementation-defined; both have been used historically. Crawlers MUST receive 302.
+- **Not-found resolution**: when `shortUrl` does not exist or has been deactivated, respond with HTTP 404. The body MAY be HTML or JSON; deployed link previews tolerate either.
+- **Threat-deactivation parity**: a previously-resolvable short URL MAY become 404 if its destination is detected as malicious. This is a documented and acceptable outcome from a citizen's perspective.
 
-External callers parse the following response shapes verbatim. A conforming implementation MUST preserve them.
+Behaviors that are **not** part of the external contract and may change:
 
-| Endpoint | Success body |
-|---|---|
-| `POST /api/login/otp` | `{ message: "OTP generated and sent." }` |
-| `POST /api/login/verify` | `{ message: "OTP hash verification ok.", user }` |
-| `GET /api/login/isLoggedIn` | `{ user: { id, email } }` |
-| `GET /api/logout` | `{ message: "Logged out" }` |
-| `GET /api/stats` | `{ userCount, clickCount, linkCount }` |
-| `GET /api/user/url` | `{ urls: StorableUrl[], count }` |
-| `POST /api/user/url`, `PATCH /api/user/url` | `StorableUrl` |
-| `GET /api/link-stats` | `{ totalClicks, deviceClicks, dailyClicks, weekdayClicks }` |
-| `GET /api/link-audit` | `{ changes, limit, offset, totalCount }` |
-| `GET /api/directory/search` | `{ urls: [{ shortUrl, email, state, isFile }], count }` |
-| `GET /api/user/job/status`, `/latest` | `{ job, jobItemUrls }` |
-| `POST /api/user/url/bulk` | `{ count, job? }` |
-| `POST /api/user/apiKey` | `{ apiKey }` |
-| `GET /api/user/hasApiKey` | `{ message: 'true' | 'false' }` (note: stringly-typed, not boolean) |
-| `GET /api/qrcode` | binary image; header `Filename: ${displayHostname}/${shortUrl}` |
-| Validation error | `{ message: <joi error string> }` with HTTP 400 |
-| Auth failure | `{ message: <reason> }` with HTTP 401 |
+- The exact HTML rendered on the transition page or 404 page.
+- The Google Analytics events emitted during a redirect.
+- The internal mechanism (cache, replica, transition-page suppression cookie) used to compute the redirect.
+- Whether the transition page is shown at all, and the criteria for showing it.
 
-The `hasApiKey` `'true'`/`'false'` string is a known wart; clients in the wild parse this textually and MUST continue to receive it.
+### 27.3 File-hosting URLs (external)
 
-The external v1 API uses `UrlV1Mapper` to omit internal fields (`safeBrowsingExpiry`, `userId`) from `StorableUrl`. This DTO is the **stable, versioned** shape returned by `/api/v1/urls` and MUST be preserved across non-major versions.
+When a short link points to a hosted file, its `longUrl` MUST take the form:
 
-### 27.5 Authentication semantics (HARD compatibility)
+```
+https://{FILE_HOSTNAME}/{shortUrl}.{ext}
+```
 
-- API keys generated under `API_KEY_VERSION = 'v1'` MUST continue to authenticate after any code refactor. The key format is `${env}_${version}_${random}`; the stored hash form is `${env}_${version}_${bcrypt(random, API_KEY_SALT)}`. Salt rotation invalidates all keys and is OUT OF SCOPE for a minor release.
-- The session cookie MUST be named `gogovsg`. Browser sessions issued under a prior deployment MUST remain valid until natural expiry, so the cookie name, secret, and store layout (`connect-redis`) MUST NOT change.
-- The visits cookie MUST be named `visits`. Renaming it would re-show transition pages to every existing visitor.
-- The OTP flow MUST keep the email-allowlist behavior: `validator.isEmail` AND `minimatch(VALID_EMAIL_GLOB_EXPRESSION, …)` with `{ noext: false, noglobstar: true, nobrace: true, nonegate: true }`. Some integrations rely on this glob being **published verbatim** through `GET /api/login/emaildomains`.
+where `FILE_HOSTNAME` is the public file-serving hostname for the variant (canonically `file.go.gov.sg`, `file.for.edu.sg`, `file.for.sg`). This URL is what citizens see, what gets shared in messages, and what is stored in `urls.longUrl` for every file-backed short link issued to date.
 
-### 27.6 Feature-flag gating
+Required behaviors:
 
-- `FF_EXTERNAL_API` MUST gate `/api/v1/*` and `/api/v1/admin/*` as an *all-or-nothing* switch. When off, requests to those paths MUST return 404 (Express router not mounted), **not** 401. Existing integrators detect "API disabled" by 404 from `/api/v1/urls`.
-- `FF_USE_REPLICA_FOR_REDIRECTS` controls the redirect lookup path. Turning it on or off MUST be transparent to clients: cache semantics, response shape, and 302/200 outcomes MUST be identical.
+- The hostname and key format MUST resolve every file URL ever issued. A reimplementation that wants to move to a different storage backend MUST either keep the hostname pointing at the new backend with key-compatible paths, or maintain a redirect from the legacy URLs.
+- The `{ext}` portion MUST match the actual file's extension and be a single segment.
 
-### 27.7 Auxiliary endpoints
+Behaviors that may change:
 
-These are not listed in Appendix E because they exist outside `/api`, but they are part of the public contract:
+- The storage backend itself (S3, GCS, on-prem, etc.).
+- The `Content-Type`, `Cache-Control`, and ACL semantics of the underlying object — as long as the URL remains fetchable by a browser.
+- The internal key format inside the storage backend, as long as the public URL is preserved.
 
-- `GET /assets/transition-page/js/redirect.js` — server-rendered JavaScript with `Content-Type: text/javascript`. Used by the transition page's HTML to fire GA events. Inlining this script into the transition HTML is **not** an acceptable substitute, because the asset URL is referenced by deployed pages.
-- `GET /locales/{variant}/en/translation.json` — static, served from `public/`. The client loads it via i18next at startup. Any change to the schema is a breaking change for the client bundle.
+### 27.4 External REST API v1 (external)
 
-### 27.8 Soft-compatibility guidelines
+The `/api/v1/*` and `/api/v1/admin/*` namespaces are the documented integration surface for third parties. A reimplementation MUST preserve:
 
-The following are not strict requirements but SHOULD be preserved:
+- **Paths and HTTP methods** exactly:
+  - `GET /api/v1/urls`
+  - `POST /api/v1/urls`
+  - `PATCH /api/v1/urls/:shortUrl`
+  - `POST /api/v1/admin/urls`
+- **Authentication scheme**: `Authorization: Bearer <apiKey>` (§8.2 / §27.5).
+- **Feature-flag gating**: when `FF_EXTERNAL_API` is disabled, these paths MUST return HTTP 404 (not 401). Integrators detect "API disabled" by 404.
+- **Request schema** for each route, as defined in §19. New optional fields MAY be added; required fields MUST NOT be added; existing required fields MUST NOT be removed.
+- **Response schema** for each route. The mapped `StorableUrl` returned by these endpoints is a stable, versioned DTO — it omits internal fields (`safeBrowsingExpiry`, `userId`) by design. Adding fields is safe; removing, renaming, or retyping fields is not.
+- **Status codes**: 200 on success, 400 on validation failure, 401 on missing/invalid API key, 404 when the feature is disabled or the resource is absent. Status semantics MUST NOT shift between these classes.
 
-- 404 status codes for resources that the caller does not own (rather than 403). This avoids enumeration of other users' short URLs.
-- Failure to delete an OTP from Redis after successful verification MUST be a non-fatal warning, not a 500. Existing clients have observed eventual consistency here.
-- The `Cache-Control: no-store` header on every API response is relied on by browser extensions that proxy GoGovSG for accessibility tooling.
-- The morgan log format MAY be extended, but the existing tokens `client-ip`, `redirectUrl`, and `userId` MUST be retained — downstream log pipelines parse them positionally.
+Implementation details that MAY change:
 
-### 27.9 Removal policy
+- The internal handler that backs each route.
+- Whether `:shortUrl` is lifted into the request body before validation (the existing implementation does this via a middleware; a rewrite need not).
+- The on-disk representation of the URL record.
+- The presence of additional response fields beyond the documented schema.
 
-Adding fields to a response body is non-breaking and MAY be done freely. **Removing** a field, renaming a field, narrowing a type, or tightening a validator is breaking and MUST be accompanied by:
+### 27.5 API key authentication (external)
 
-1. A new versioned route (e.g., `/api/v2/...`).
-2. A deprecation period of at least one quarter for the legacy route.
-3. A `Deprecation` HTTP response header on the legacy route during the deprecation period.
+API keys issued by the current deployment MUST continue to authenticate after a rewrite. A key is the opaque string `${env}_${version}_${random}` returned once at generation time. To preserve this:
+
+- The hash stored at `users.apiKeyHash` MUST remain verifiable. The existing format is `${env}_${version}_${bcrypt(random, API_KEY_SALT)}`. A reimplementation MAY use a different verification scheme **only if** it migrates existing hashes to the new scheme during deployment, or rejects existing keys and forces all integrators to re-generate.
+- A rewrite that wishes to preserve existing keys MUST therefore preserve the bcrypt verification path and the `API_KEY_SALT` environment variable.
+- A rewrite that explicitly does *not* wish to preserve existing keys MUST publish a key-rotation deadline before deployment.
+
+`API_KEY_VERSION` exists precisely to bracket this concern. Bumping the version (`v1` → `v2`) is a clean way to introduce a new format while continuing to verify old keys against the old format.
+
+### 27.6 Out of scope for backward compatibility
+
+The following are part of the rewrite's own design surface and MAY change freely:
+
+| Surface | Why it's internal |
+|---------|-------------------|
+| All `/api/*` routes outside `/api/v1/*` | Consumed only by the SPA, which is rewritten together with the server. |
+| `/api/login/*`, `/api/logout`, `/api/user/*`, `/api/qrcode`, `/api/link-stats`, `/api/link-audit`, `/api/directory/search`, `/api/callback/qr`, `/api/stats`, `/api/links`, `/api/ga` | Same reason. |
+| Cookie names (`gogovsg`, `visits`) | Session cookies are reissued on next login; the visits cookie at worst causes one extra transition-page display. |
+| Session-store technology (`connect-redis` layout) | A rewrite may use any session backend. |
+| `GET /assets/transition-page/js/redirect.js` | An implementation detail of the transition page; if the rewrite renders the transition page differently, this route can disappear. |
+| Locale loader path `/locales/{variant}/en/...` | Tied to the SPA's i18next configuration. |
+| The `hasApiKey` stringly-typed `'true'/'false'` response | SPA-only; safe to replace with a boolean. |
+| The Joi-on-body validator over `GET /api/user/url` that reads from `req.query` | SPA-only quirk. |
+| Internal headers like `Cache-Control: no-store` | A rewrite may apply different caching policies. |
+| The morgan log format and StatsD metric names | Internal observability — a rewrite may emit different telemetry. |
+| HTML 404, 500 templates | Visual surface, free to redesign. |
+
+### 27.7 Removal policy for the External REST API
+
+Because §27.4 is the only HTTP surface bound by an external versioning contract, removal of an `/api/v1/*` field follows this policy:
+
+1. Introduce a new versioned namespace (`/api/v2/*`).
+2. Continue serving `/api/v1/*` for at least one quarter after the new version is announced.
+3. Emit a `Deprecation` HTTP response header on every `/api/v1/*` response during the deprecation window.
+
+Adding fields to existing `/api/v1/*` responses is non-breaking and requires no version bump.
 
 ---
 
@@ -1876,45 +1912,49 @@ i18next is initialized with `lng: 'en'`, `fallbackLng: 'en'`, `whitelist: ['en']
 
 ## Appendix E. Public Surface Map
 
-A single-page index of every public HTTP route. `S` = session required, `K` = API key required, `A` = admin role required, `–` = public.
+A single-page index of every public HTTP route.
 
-| Method | Route | Auth | Section |
-|--------|-------|------|---------|
-| `GET` | `/:shortUrl` | – | §10 |
-| `GET` | `/api/ga` | – | §15.4 |
-| `GET` | `/api/stats` | – | §15.1 |
-| `GET` | `/api/links` | – | §5, §18.3 |
-| `GET` | `/api/login/message` | – | §8.1 |
-| `GET` | `/api/login/emaildomains` | – | §8.1 |
-| `POST` | `/api/login/otp` | – (IP rate-limited) | §8.1 |
-| `POST` | `/api/login/verify` | – | §8.1 |
-| `GET` | `/api/login/isLoggedIn` | – | §8.1 |
-| `GET` | `/api/logout` | – | §8.3 |
-| `GET` | `/api/user/url` | S | §9.5 |
-| `POST` | `/api/user/url` | S | §9.1 |
-| `PATCH` | `/api/user/url` | S | §9.2 |
-| `PATCH` | `/api/user/url/ownership` | S | §9.3 |
-| `POST` | `/api/user/url/bulk` | S | §13.1 |
-| `GET` | `/api/user/tag` | S | §9.6 |
-| `POST` | `/api/user/apiKey` | S | §8.2 |
-| `GET` | `/api/user/hasApiKey` | S | §8.2 |
-| `GET` | `/api/user/message` | S | §6.3 |
-| `GET` | `/api/user/announcement` | S | §6.3 |
-| `GET` | `/api/user/job/latest` | S | §13.5 |
-| `GET` | `/api/user/job/status` | S | §13.5 |
-| `GET` | `/api/qrcode` | S | §14.1 |
-| `GET` | `/api/link-stats` | S | §15.2 |
-| `GET` | `/api/link-audit` | S | §16 |
-| `GET` | `/api/directory/search` | S | §17 |
-| `POST` | `/api/callback/qr` | K + A | §13.4 |
-| `GET` | `/api/v1/urls` | K | §19.1 |
-| `POST` | `/api/v1/urls` | K | §19.1 |
-| `PATCH` | `/api/v1/urls/:shortUrl` | K | §19.1 |
-| `POST` | `/api/v1/admin/urls` | K + A | §19.2 |
-| `GET` | `/assets/transition-page/js/redirect.js` | – | §10.1, §27.7 |
-| `GET` | `/locales/:variant/en/translation.json` | – | §18.9, §27.7 |
+Columns:
+- **Auth**: `S` = session required, `K` = API key required, `A` = admin role required, `–` = public.
+- **BC**: backward-compatibility class. **`E`** = externally-binding (third-party integrators, published links, or stored URLs in the wild depend on this route — see §27); **`I`** = internal (consumed only by the GoGovSG SPA or other rewritable surfaces; may be redesigned).
 
-All non-redirect responses are served with `Cache-Control: no-store`. All responses include the helmet-derived headers of §22.5. Routes whose paths are normative for backward compatibility are listed in §27.
+| Method | Route | Auth | BC | Section |
+|--------|-------|------|----|---------|
+| `GET` | `/:shortUrl` | – | **E** | §10, §27.2 |
+| `GET` | `/api/v1/urls` | K | **E** | §19.1, §27.4 |
+| `POST` | `/api/v1/urls` | K | **E** | §19.1, §27.4 |
+| `PATCH` | `/api/v1/urls/:shortUrl` | K | **E** | §19.1, §27.4 |
+| `POST` | `/api/v1/admin/urls` | K + A | **E** | §19.2, §27.4 |
+| `GET` | `/api/ga` | – | I | §15.4 |
+| `GET` | `/api/stats` | – | I | §15.1 |
+| `GET` | `/api/links` | – | I | §5, §18.3 |
+| `GET` | `/api/login/message` | – | I | §8.1 |
+| `GET` | `/api/login/emaildomains` | – | I | §8.1 |
+| `POST` | `/api/login/otp` | – (IP rate-limited) | I | §8.1 |
+| `POST` | `/api/login/verify` | – | I | §8.1 |
+| `GET` | `/api/login/isLoggedIn` | – | I | §8.1 |
+| `GET` | `/api/logout` | – | I | §8.3 |
+| `GET` | `/api/user/url` | S | I | §9.5 |
+| `POST` | `/api/user/url` | S | I | §9.1 |
+| `PATCH` | `/api/user/url` | S | I | §9.2 |
+| `PATCH` | `/api/user/url/ownership` | S | I | §9.3 |
+| `POST` | `/api/user/url/bulk` | S | I | §13.1 |
+| `GET` | `/api/user/tag` | S | I | §9.6 |
+| `POST` | `/api/user/apiKey` | S | I | §8.2 |
+| `GET` | `/api/user/hasApiKey` | S | I | §8.2 |
+| `GET` | `/api/user/message` | S | I | §6.3 |
+| `GET` | `/api/user/announcement` | S | I | §6.3 |
+| `GET` | `/api/user/job/latest` | S | I | §13.5 |
+| `GET` | `/api/user/job/status` | S | I | §13.5 |
+| `GET` | `/api/qrcode` | S | I | §14.1 |
+| `GET` | `/api/link-stats` | S | I | §15.2 |
+| `GET` | `/api/link-audit` | S | I | §16 |
+| `GET` | `/api/directory/search` | S | I | §17 |
+| `POST` | `/api/callback/qr` | K + A | I | §13.4 |
+| `GET` | `/assets/transition-page/js/redirect.js` | – | I | §10.1 |
+| `GET` | `/locales/:variant/en/translation.json` | – | I | §18.9 |
+
+A rewrite that wishes to remain compatible with deployed links and existing API integrations need only preserve the **E**-class rows of this table (plus the file URL shape of §27.3 and the API key verification rules of §27.5). All **I**-class rows may be redesigned, removed, or replaced; the SPA must be updated in lockstep.
 
 ---
 
