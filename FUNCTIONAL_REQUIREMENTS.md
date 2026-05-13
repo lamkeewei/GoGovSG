@@ -211,45 +211,37 @@ Requirement IDs are stable within this document and may be cited by other artifa
 
 ---
 
-## 14. Deployment Branding
-
-- **FR-14.1** A deployment's public name, short-URL origin, file-hosting hostname, allowed-email-domain pattern, and brand color/logo for QR codes MUST be configurable per deployment.
-- **FR-14.2** The English copy used by the client (page titles, headings, prompts, link labels) MUST be loaded from a single localisation bundle for the deployment, not hard-coded.
-- **FR-14.3** Only English is supported as a UI language.
-
----
-
-## 15. Citizen-facing Behavioral Guarantees
+## 14. Citizen-facing Behavioral Guarantees
 
 These requirements describe behaviors visible to citizens (and to integrators with deployed links) that MUST NOT regress without an explicit migration.
 
-- **FR-15.1** Short-URL paths in the form `/<slug>` MUST continue to resolve at the deployment's production origin.
-- **FR-15.2** Resolution MUST remain case-insensitive and trailing-character tolerant (FR-5.2, FR-5.3) so that links shared in older messages keep working.
-- **FR-15.3** File URLs in the form `https://<file-hosting hostname>/<slug>.<ext>` MUST continue to resolve to the corresponding file as long as the link is active.
-- **FR-15.4** A successful redirect MUST take the visitor to the destination URL either directly or after a transition page; in either case the destination is reached.
-- **FR-15.5** When a link is unknown or inactive, the citizen MUST see a clear "not found" experience, not an internal-error page.
+- **FR-14.1** Short-URL paths in the form `/<slug>` MUST continue to resolve at the deployment's production origin.
+- **FR-14.2** Resolution MUST remain case-insensitive and trailing-character tolerant (FR-5.2, FR-5.3) so that links shared in older messages keep working.
+- **FR-14.3** File URLs in the form `https://<file-hosting hostname>/<slug>.<ext>` MUST continue to resolve to the corresponding file as long as the link is active.
+- **FR-14.4** A successful redirect MUST take the visitor to the destination URL either directly or after a transition page; in either case the destination is reached.
+- **FR-14.5** When a link is unknown or inactive, the citizen MUST see a clear "not found" experience, not an internal-error page.
 
 ---
 
-## 16. Failure Behavior
+## 15. Failure Behavior
 
-- **FR-16.1** A failure of an optional integration (threat-scan service, antivirus, web analytics, observability) MUST NOT take down primary user flows.
-- **FR-16.2** A failure to record a click MUST NOT delay or block the user-visible redirect.
-- **FR-16.3** A failure during a bulk upload MUST be reported to the user with row-level diagnostics (which row failed, why); no partial state MUST result.
-- **FR-16.4** Bulk-QR jobs MUST surface terminal status (success or failure) to the requesting officer through both the dashboard and email notification.
+- **FR-15.1** A failure of an optional integration (threat-scan service, antivirus, web analytics, observability) MUST NOT take down primary user flows.
+- **FR-15.2** A failure to record a click MUST NOT delay or block the user-visible redirect.
+- **FR-15.3** A failure during a bulk upload MUST be reported to the user with row-level diagnostics (which row failed, why); no partial state MUST result.
+- **FR-15.4** Bulk-QR jobs MUST surface terminal status (success or failure) to the requesting officer through both the dashboard and email notification.
 
 ---
 
-## 17. Out of Scope
+## 16. Out of Scope
 
 The following are explicitly NOT functional requirements of this system.
 
-- **FR-17.1** Multi-factor authentication beyond the OTP itself.
-- **FR-17.2** Per-click geolocation, referrer tracking, or visitor-identity profiling.
-- **FR-17.3** Internationalisation of the UI beyond English.
-- **FR-17.4** Acceptance of arbitrary file MIME types beyond the allowlist of FR-4.2.
-- **FR-17.5** Click-rate throttling on the redirect surface.
-- **FR-17.6** Recovery of forgotten or compromised API keys (only rotation is supported).
+- **FR-16.1** Multi-factor authentication beyond the OTP itself.
+- **FR-16.2** Per-click geolocation, referrer tracking, or visitor-identity profiling.
+- **FR-16.3** Internationalisation of the UI beyond English.
+- **FR-16.4** Acceptance of arbitrary file MIME types beyond the allowlist of FR-4.2.
+- **FR-16.5** Click-rate throttling on the redirect surface.
+- **FR-16.6** Recovery of forgotten or compromised API keys (only rotation is supported).
 
 ---
 
