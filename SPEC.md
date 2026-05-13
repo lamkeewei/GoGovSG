@@ -10,37 +10,29 @@ The document uses RFC 2119 keywords (`MUST`, `SHOULD`, `MAY`, `MUST NOT`) when s
 
 1. Problem Statement
 2. Goals and Non-Goals
-3. System Overview
-4. Core Domain Model
-5. Deployment Branding
-6. Configuration Specification
-7. Identifiers, Validation, and Constants
-8. Authentication and Session Management
-9. Short URL Lifecycle
-10. Redirect Service
-11. File Hosting
-12. Threat Detection
-13. Bulk Operations and Async Jobs
-14. QR Code Generation
-15. Statistics and Analytics
-16. Audit Trail (Link History)
-17. Public Directory Search
-18. Client Application
-19. External REST API (v1)
-20. Email Delivery
-21. Persistence and Caching
-22. Observability, Security, and Operations
-23. Failure Model and Recovery
-24. Reference Algorithms
-25. Test and Validation Matrix
-26. Implementation Checklist
-27. Backward Compatibility (External Surfaces Only)
+3. Deployment Branding
+4. Configuration
+5. Identifiers, Validation, and Constants
+6. Authentication and Session Management
+7. Short URL Lifecycle
+8. Redirect Service
+9. File Hosting
+10. Threat Detection
+11. Bulk Operations and Async Jobs
+12. QR Code Generation
+13. Statistics and Analytics
+14. Audit Trail (Link History)
+15. Public Directory Search
+16. Client Application
+17. External REST API (v1)
+18. Email Delivery
+19. Security Headers and Rate Limiting
+20. Failure Model and Recovery
+21. Backward Compatibility (External Surfaces Only)
 
-Appendix A. Serverless Functions
-Appendix B. Validation Rules Reference
-Appendix C. Metrics Reference
-Appendix D. Locale Schema
-Appendix E. Public Surface Map
+Appendix A. Validation Rules Reference
+Appendix B. Locale Schema
+Appendix C. Public Surface Map
 
 ---
 
@@ -82,150 +74,7 @@ The system also serves as a controlled file-hosting endpoint, so officers can pu
 
 ---
 
-## 3. System Overview
-
-### 3.1 Components
-
-A conforming implementation consists of the following logical components. Concrete technology choices for each are implementation-defined; the names below are roles, not products.
-
-1. **HTTP server** that serves three classes of route: redirect (`GET /:shortUrl`), API (`/api/*`), and static assets (the client bundle, locales, transition page, error page).
-2. **Primary durable store** holding users, URLs, tags, jobs, click aggregates, and an append-only URL history. Any storage technology that supports transactions, secondary indexes, and full-text search over weighted text fields is acceptable.
-3. **Read replica** (optional) for read-heavy paths (redirect lookups, statistics) when the corresponding feature flag is enabled.
-4. **Five logical caches** with independent eviction and TTL policies: OTP cache, session store, redirect cache, statistics cache, URL threat-scan cache. They MAY share an underlying storage technology or be separate; only their key spaces and TTLs are normative.
-5. **Object store** for hosted files, fronted by a public hostname (§11).
-6. **Async job pipeline** for QR-code bundle generation: a durable queue that fans out batches to one or more background workers, which write artifacts back to the object store and notify the server through a callback.
-7. **Email transport** for OTP delivery and job-completion notifications.
-8. **External integrations** (all optional): URL threat-scanning service, antivirus service, web analytics, observability platform.
-9. **Single-page client** comprising five subapplications (home, login, user dashboard, public directory, API integration).
-10. **Out-of-band utilities** for link ownership migration and email-delivery event capture (Appendix A).
-
-### 3.2 Layering
-
-The server is organized in three logical layers, regardless of how the source tree is arranged:
-
-- **API layer** — request routing, schema validation, authentication/authorization middleware.
-- **Module layer** — controllers and services implementing business rules. The functional modules are: `auth`, `user`, `bulk`, `job`, `qr`, `redirect`, `threat`, `audit`, `analytics`, `statistics`, `directory`, `display`, `api`.
-- **Persistence layer** — repositories, model definitions, and caching policies.
-
-Cross-cutting concerns (configuration, logging, metrics, dependency wiring) are implementation-defined.
-
-### 3.3 Process Model
-
-The server runs as one or more long-lived processes that service every HTTP route. There are no in-process background workers other than fire-and-forget side effects (statistics increments, cache warming). Long-running work (bulk QR generation, link migration, email-event capture) MUST run out-of-process and SHOULD be horizontally scalable independent of the HTTP server.
-
----
-
-## 4. Core Domain Model
-
-The domain consists of seven first-class entities, each with a stable identifier and a defined lifecycle. The schema below is conceptual; concrete representation (table layout, document shape, key encoding, index types) is implementation-defined. What MUST be preserved is the set of attributes, their constraints, and the relationships between entities.
-
-### 4.1 User
-
-Represents one authenticated officer.
-
-| Attribute | Logical type | Constraints |
-|-----------|--------------|-------------|
-| `id` | opaque identifier | Server-assigned, stable for the lifetime of the user. |
-| `email` | string, unique, lowercase | MUST satisfy the validation rules of §7.3. Normalized to lowercase on write. |
-| `apiKeyHash` | string, unique, nullable | Stored verifier for an API key (§8.2). |
-| `createdAt`, `updatedAt` | timestamp | Server-managed. |
-
-A user is created lazily the first time their email successfully verifies an OTP, or the first time an admin provisions a link on their behalf.
-
-### 4.2 Url
-
-Represents one short link, identified by its short URL slug.
-
-| Attribute | Logical type | Constraints |
-|-----------|--------------|-------------|
-| `shortUrl` | string identifier | Primary key. MUST match `/^[a-zA-Z0-9-]+$/`. Treated case-insensitively at lookup (§10, §27.2). |
-| `longUrl` | string, non-null | MUST validate per §7.2. For file links, holds the public file URL (§11). |
-| `state` | enum (`ACTIVE`, `INACTIVE`) | Default `ACTIVE`. Inactive URLs MUST resolve to 404 on redirect. |
-| `isFile` | boolean | `true` ⇔ `longUrl` is a file-hosting URL. |
-| `contactEmail` | string, nullable | MUST be lowercased and pass the email check of §7.3 if present. |
-| `description` | string | Max 200 printable ASCII characters. Default empty. |
-| `source` | enum (`BULK`, `API`, `CONSOLE`) | Records origin of creation. |
-| `tags` | set of tag references | At most 3 tags per link (§4.3). |
-| `tagStrings` | string | Display denormalization of `tags` (e.g., semicolon-separated), used for ordering and search. Implementation-defined whether this is stored or derived. |
-| `safeBrowsingExpiry` | timestamp, nullable | Expiry of the last clean URL threat scan (§12.1). |
-| `userId` | reference to User, nullable | Owner. |
-| `createdAt`, `updatedAt` | timestamp | |
-
-Lookup by `shortUrl` MUST be O(1)-equivalent (hash-indexed or cached). Directory search (§17) requires a ranking mechanism that weights matches in `shortUrl`, `longUrl`, and `description` with progressively decreasing relevance.
-
-### 4.3 Tag
-
-Represents one normalized tag.
-
-| Attribute | Logical type | Constraints |
-|-----------|--------------|-------------|
-| `id` | opaque identifier | Server-assigned. |
-| `tagString` | string, unique | Display form. Matches `/^[A-Za-z0-9_-]+$/`, ≤ 25 chars. |
-| `tagKey` | string | Lowercased form of `tagString` used for case-insensitive search. |
-| `createdAt`, `updatedAt` | timestamp | |
-
-`Url` ⇄ `Tag` is many-to-many. A link MUST NOT carry more than `MAX_NUM_TAGS_PER_LINK = 3` tags. The same `Tag` MAY be reused across multiple links; the association MUST be reference-counted (implementation-defined) or at least non-destructive on unlink.
-
-### 4.4 UrlHistory
-
-Append-only history of every `Url` mutation. Every create, update, or ownership transfer of a `Url` MUST produce one `UrlHistory` record automatically; bulk mutations that bypass this invariant are forbidden.
-
-| Attribute | Logical type | Notes |
-|-----------|--------------|-------|
-| `id` | opaque identifier | |
-| `urlShortUrl` | reference to Url | Indexed for history retrieval. |
-| `userId` | reference to User | Acting user. |
-| `longUrl`, `state`, `isFile`, `contactEmail`, `description`, `source`, `tagStrings` | same types as `Url` | Denormalized snapshot at the moment of change. |
-| `createdAt`, `updatedAt` | timestamp | |
-
-The audit endpoint (§16) reads history in reverse chronological order and computes change sets pairwise.
-
-### 4.5 Click Statistics
-
-Click counts are tracked in four logical aggregates, all keyed by `shortUrl`. They MAY be stored in a single record, four records, or any other layout that supports atomic increment.
-
-- **Total clicks** — single integer counter per short URL.
-- **Device-class totals** — four counters per short URL: `mobile`, `tablet`, `desktop`, `others`.
-- **Daily totals** — one counter per (`shortUrl`, `date`) pair.
-- **Weekday/hour heatmap** — one counter per (`shortUrl`, weekday ∈ [0,7), hour ∈ [0,24)) triple.
-
-All time-dimensioned counters MUST be keyed in **Asia/Singapore** local time. A total-clicks entry MUST exist for every `Url` (created together with it). The total-clicks aggregate MUST support efficient descending ordering for popularity sorting.
-
-### 4.6 Job and JobItem
-
-Async-job tracking for bulk QR generation.
-
-**Job**:
-
-| Attribute | Logical type | Notes |
-|-----------|--------------|-------|
-| `id` | opaque identifier | |
-| `uuid` | UUID, unique | External identifier exposed to the client. |
-| `userId` | reference to User | |
-| `status` | enum (`IN_PROGRESS`, `SUCCESS`, `FAILURE`) | Default `IN_PROGRESS`. Computed aggregate over items. |
-| `createdAt`, `updatedAt` | timestamp | |
-
-**JobItem**:
-
-| Attribute | Logical type | Notes |
-|-----------|--------------|-------|
-| `id` | opaque identifier | |
-| `jobItemId` | string, unique | Format: `${job.uuid}/${batchIndex}`. Used as the artifact key in the object store and as the worker-callback handle. |
-| `jobId` | reference to Job | |
-| `status` | enum (`IN_PROGRESS`, `SUCCESS`, `FAILURE`) | Default `IN_PROGRESS`. |
-| `message` | string | Free-form failure detail. Default empty. |
-| `params` | structured value | Payload supplied to the background worker. |
-| `createdAt`, `updatedAt` | timestamp | |
-
-Job aggregate status is computed from items per §13.3.
-
-### 4.7 OTP Record
-
-A short-lived authentication record. Key: `${email}:${ip}`. Value: `{ hashedOtp, retries }`. TTL: `OTP_EXPIRY` seconds (default 300). MUST be evicted automatically on TTL expiry; explicit deletion on successful verification is REQUIRED. Implementation MUST use a store that supports atomic decrement of the retry counter under contention.
-
----
-
-## 5. Deployment Branding
+## 3. Deployment Branding
 
 The system runs as a single deployment. Its public identity (name, hostnames, allowed email domain, on-page copy, QR-code styling) is supplied through runtime configuration rather than being hardwired in source.
 
@@ -233,106 +82,85 @@ The configurable identity surface consists of:
 
 - **`OG_URL`** — the canonical origin URL (e.g., `https://go.gov.sg`). Used for circular-redirect prevention, trusted-referrer detection, and as the basis for constructing the full short link in QR codes.
 - **`VALID_EMAIL_GLOB_EXPRESSION`** — the email-domain allowlist (e.g., `*.gov.sg`).
-- **`AWS_S3_BUCKET`** — the file-hosting bucket name. In production this is also the hostname of the file-serving domain (e.g., `file.go.gov.sg`), making the canonical file URL `https://${AWS_S3_BUCKET}/${shortUrl}.${ext}`. See §11.
+- **`AWS_S3_BUCKET`** — the file-hosting bucket name. In production this is also the hostname of the file-serving domain (e.g., `file.go.gov.sg`), making the canonical file URL `https://${AWS_S3_BUCKET}/${shortUrl}.${ext}`. See §9.
 - **Display name** — the human-readable service name (e.g., "Go.gov.sg") returned in API responses and shown in templated HTML (transition page, 404 page).
-- **Locale strings** — the single English copy bundle loaded by the client (§18.9, Appendix D).
-- **QR-code brand color and logo** — the dark color used when rendering QR codes (§14) and the centered logo overlay.
+- **Locale strings** — the single English copy bundle loaded by the client (§16.8, Appendix B).
+- **QR-code brand color and logo** — the dark color used when rendering QR codes (§12) and the centered logo overlay.
 
-A reimplementation that needs only one deployment MAY hard-code these values as long as the External REST API contract (§27.4) and the file URL shape (§27.3) remain configurable through deployment, since they affect URLs already in the wild.
+A reimplementation that needs only one deployment MAY hard-code these values as long as the External REST API contract (§21.4) and the file URL shape (§21.3) remain configurable through deployment, since they affect URLs already in the wild.
 
 ---
 
-## 6. Configuration Specification
+## 4. Configuration
 
-Configuration is supplied via environment variables. The application MUST validate required variables at startup and exit with status 1 if any are missing.
+The deployment MUST supply the following configuration. Specific environment-variable names appear in this document because they are referenced by name from other sections; the values are functional inputs, not a contract about how they are loaded.
 
-### 6.1 Required Variables (all deployments)
+**Identity**
 
-| Variable | Description |
-|----------|-------------|
-| `DB_URI` | Primary durable-store connection string. |
-| `REPLICA_URI` | Read-replica connection string. |
-| `OG_URL` | Origin URL of the service (e.g., `https://go.gov.sg`); used for circular-redirect prevention and trusted-referrer detection. |
-| `REDIS_OTP_URI` | Connection string for the OTP cache. |
-| `REDIS_SESSION_URI` | Connection string for the session store. |
-| `REDIS_REDIRECT_URI` | Connection string for the redirect cache. |
-| `REDIS_STAT_URI` | Connection string for the statistics cache. |
-| `REDIS_SAFE_BROWSING_URI` | Connection string for the URL threat-scan cache. |
-| `SESSION_SECRET` | Secret for session-token signing and the visit-tracking cookie. |
-| `VALID_EMAIL_GLOB_EXPRESSION` | Glob pattern (extended-glob, globstar, brace, and negation are disabled). |
-| `AWS_S3_BUCKET` | Bucket name for file uploads. |
-| `API_KEY_SALT` | Salt used by the password-hashing function for API key suffixes. |
-| Display name | Human-readable service name shown in templated HTML and returned in some API responses. Implementation-defined (env var or build-time constant). |
+- `OG_URL` — origin URL of the service (e.g., `https://go.gov.sg`). Used for circular-redirect prevention, trusted-referrer detection, and as the basis for building the full short link encoded in QR codes.
+- `VALID_EMAIL_GLOB_EXPRESSION` — glob pattern that defines which email addresses may sign in. Extended-glob, globstar, brace, and negation expansions MUST be disabled.
+- `AWS_S3_BUCKET` — public hostname (and storage bucket) for hosted files. See §9.
+- Display name — human-readable service name returned in API responses and rendered in templated HTML.
 
-### 6.2 Production-only Required Variables
+**Secrets**
 
-`SES_HOST`, `SES_PORT`, `SES_USER`, `SES_PASS` MUST be set when `NODE_ENV !== 'development'`.
+- `SESSION_SECRET` — used to sign session tokens and the visit-tracking cookie.
+- `API_KEY_SALT` — salt for the password-hashing function used on API key suffixes.
 
-### 6.3 Optional Variables and Defaults
+**Functional defaults**
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `NODE_ENV` | `production` | Controls cookie security, log level, OTP rate-limit enforcement. |
-| `SALT_ROUNDS` | 10 | Password-hash work factor (bcrypt-equivalent cost) for OTPs and API keys. |
-| `OTP_EXPIRY` | 300 (s) | OTP TTL. |
-| `REDIRECT_EXPIRY` | 300 (s) | Redirect-cache TTL. |
-| `COOKIE_MAX_AGE` | 86_400_000 (ms = 24 h) | Session cookie lifetime. |
-| `BULK_UPLOAD_MAX_NUM` | 1000 | Max URLs per CSV. |
-| `BULK_UPLOAD_RANDOM_STR_LENGTH` | 8 | Generated short-URL length for bulk. |
-| `API_LINK_RANDOM_STR_LENGTH` | 8 | Generated short-URL length for API. |
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `OTP_EXPIRY` | 300 s | OTP validity window. |
+| `OTP_RATE_LIMIT` | implementation-defined | OTP requests per IP per minute. May be 0 (disabled) for local development. |
+| `REDIRECT_EXPIRY` | 300 s | Redirect-cache TTL. |
+| `COOKIE_MAX_AGE` | 24 h | Session cookie lifetime. |
+| `SALT_ROUNDS` | 10 | Password-hash work factor for OTPs and API keys. |
+| `BULK_UPLOAD_MAX_NUM` | 1000 | Maximum URLs per bulk CSV. |
+| `BULK_UPLOAD_RANDOM_STR_LENGTH` | 8 | Generated short-URL length for bulk-created links. |
+| `API_LINK_RANDOM_STR_LENGTH` | 8 | Generated short-URL length for API-created links. |
 | `BULK_QR_CODE_BATCH_SIZE` | 1000 | URLs per background-worker batch. |
-| `BULK_QR_CODE_BUCKET_URL` | empty | Base URL used when constructing JobItem download URLs. |
-| `ACTIVATE_BULK_QR_CODE_GENERATION` | `false` | Master switch for the bulk QR generation pipeline. |
-| Async job queue endpoint | implementation-defined | Address (URL, host:port, etc.) at which the background-worker queue accepts new job-batch messages. |
-| Async job queue enqueue timeout | 10_000 (ms) | Timeout when enqueueing a job-batch message. |
-| `JOB_POLL_INTERVAL` | 5000 (ms) | Server-side long-poll interval. |
-| `JOB_POLL_ATTEMPTS` | 12 | Server-side long-poll attempts. After exhaustion respond 408. |
-| `FF_EXTERNAL_API` | `false` | Gates `/api/v1/*` and `/api/v1/admin/*`. |
-| `FF_USE_REPLICA_FOR_REDIRECTS` | `false` | Use replica DB for redirect lookups. |
-| `API_KEY_VERSION` | `v1` | Component of API key string. |
-| `ADMIN_API_EMAILS` | empty | Comma-separated emails allowed to call admin API. |
-| `SAFE_BROWSING_KEY` | undefined | Credential for the URL threat-scanning service. Disabled when unset. |
-| `SAFE_BROWSING_LOG_ONLY` | `false` | When `true`, threats are logged but not blocked. |
-| `CLOUDMERSIVE_KEY` | undefined | Antivirus key. When unset, virus scan is skipped. |
-| `CSP_REPORT_URI` | undefined | CSP violation reporting endpoint. |
-| `CSP_ONLY_REPORT_VIOLATIONS` | `false` | Run CSP in report-only mode. |
-| `GA_TRACKING_ID` | undefined | Web-analytics property identifier. |
-| `LOGIN_MESSAGE` | undefined | Banner on login page. |
-| `USER_MESSAGE` | undefined | Banner on user dashboard. |
-| `ANNOUNCEMENT_TITLE`, `ANNOUNCEMENT_SUBTITLE`, `ANNOUNCEMENT_MESSAGE`, `ANNOUNCEMENT_URL`, `ANNOUNCEMENT_IMAGE`, `ANNOUNCEMENT_BUTTON_TEXT` | undefined | Optional logged-in modal. All-or-none semantics: client renders the modal only if `ANNOUNCEMENT_MESSAGE` is truthy. |
-| `ROTATED_LINKS` | undefined | Comma-separated short URLs to rotate on the landing page. |
-| `USER_COUNT`, `CLICK_COUNT`, `LINK_COUNT` | 77288, 666_820_545, 28_151_439 | Static counters for landing page. |
-| `DB_POOL_SIZE` | 40 | Database connection-pool size. |
-| `BUCKET_ENDPOINT` | implementation-defined | Object-store endpoint override (used to point at a local emulator in development). |
-| `ACCESS_ENDPOINT` | implementation-defined | Object-store access endpoint used to construct browser-facing file URLs in development. |
-| `OTP_RATE_LIMIT` | implementation-defined; 0 in development | OTP requests per IP per minute. |
-| `DD_SERVICE`, `DD_ENV`, `DD_API_KEY` | undefined | Observability-platform identification (service name, environment, credential). The names are conventional for one popular platform; equivalents in any other observability platform are acceptable. |
-| `POSTMAN_API_URL`, `POSTMAN_API_KEY`, `ACTIVATE_POSTMAN_FALLBACK` | undefined / `false` | Optional Postman email fallback. |
+| `JOB_POLL_INTERVAL` | 5000 ms | Server-side long-poll interval. |
+| `JOB_POLL_ATTEMPTS` | 12 | Server-side long-poll attempts before responding 408. |
+| `API_KEY_VERSION` | `v1` | Version component of API key string. |
+| `USER_COUNT`, `CLICK_COUNT`, `LINK_COUNT` | static counters for the landing page. |
 
-### 6.4 Cookie Configuration
+**Feature flags**
 
-Session cookies MUST be named `gogovsg` and set with:
+- `FF_EXTERNAL_API` (default `false`) — gates `/api/v1/*` and `/api/v1/admin/*`.
+- `FF_USE_REPLICA_FOR_REDIRECTS` (default `false`) — read redirect lookups from a replica when configured.
+- `ACTIVATE_BULK_QR_CODE_GENERATION` (default `false`) — master switch for the bulk QR pipeline.
+- `SAFE_BROWSING_LOG_ONLY` (default `false`) — log URL-threat detections but do not block.
 
-```
-httpOnly: true
-sameSite: 'strict'
-secure: NODE_ENV !== 'development'
-maxAge: COOKIE_MAX_AGE
-```
+**Optional integrations**
 
-A separate cookie (conventionally `visits`) MUST track per-visitor short URL history for transition-page suppression, with `maxAge` = 7 days and signed/encrypted using `SESSION_SECRET`. Its serialized array MUST be capped at `COOKIE_SESSION_MAX_SIZE_BYTES` (default 2000) by LRU eviction.
+- `SAFE_BROWSING_KEY` — credential for the URL threat-scanning service (§10.1).
+- `CLOUDMERSIVE_KEY` — credential for the antivirus service (§10.2).
+- `GA_TRACKING_ID` — web-analytics property identifier.
+- `ADMIN_API_EMAILS` — comma-separated emails granted admin scope on the External REST API.
+
+**User-facing copy**
+
+- `LOGIN_MESSAGE` — banner on the login page.
+- `USER_MESSAGE` — banner on the user dashboard.
+- `ANNOUNCEMENT_TITLE`, `ANNOUNCEMENT_SUBTITLE`, `ANNOUNCEMENT_MESSAGE`, `ANNOUNCEMENT_URL`, `ANNOUNCEMENT_IMAGE`, `ANNOUNCEMENT_BUTTON_TEXT` — content for an optional logged-in announcement modal. The modal renders only when `ANNOUNCEMENT_MESSAGE` is truthy.
+- `ROTATED_LINKS` — comma-separated short URLs featured on the landing page.
+
+### 4.1 Cookies
+
+Session cookies MUST be `httpOnly`, `sameSite: 'strict'`, `secure` in production, and live for `COOKIE_MAX_AGE`. A separate visit-tracking cookie (conventionally `visits`) MUST be `maxAge` = 7 days, signed using `SESSION_SECRET`, and capped in serialized size (default 2000 bytes) by LRU eviction so it does not grow unboundedly across many short-URL visits.
 
 ---
 
-## 7. Identifiers, Validation, and Constants
+## 5. Identifiers, Validation, and Constants
 
-### 7.1 Short URL
+### 5.1 Short URL
 
 - Pattern: `/^[a-zA-Z0-9-]+$/`.
 - Used as the primary identifier of a `Url` entity and as the redirect-cache key (lowercased internally).
 - For auto-generation: draw characters uniformly at random from the alphabet `0123456789abcdefghijklmnopqrstuvwxyz` using a cryptographically strong random source. Length is `BULK_UPLOAD_RANDOM_STR_LENGTH` (default 8) for bulk-created links or `API_LINK_RANDOM_STR_LENGTH` (default 8) for API-created links. On collision, retry.
 
-### 7.2 Long URL
+### 5.2 Long URL
 
 Validation is centralized in `src/shared/util/validation.ts` and MUST apply on both client and server.
 
@@ -342,30 +170,30 @@ Validation is centralized in `src/shared/util/validation.ts` and MUST apply on b
 - MUST NOT be circular: the URL's hostname MUST NOT resolve to the service origin (`OG_URL` hostname).
 - MUST NOT match the blacklist (substring blocklist sourced from `src/server/resources/blacklist`).
 
-### 7.3 Email
+### 5.3 Email
 
 - MUST pass `validator.isEmail()` with `{ allow_utf8_local_part: false }`.
 - MUST be lowercased and trimmed before storage and before pattern matching.
 - MUST satisfy a glob match against `VALID_EMAIL_GLOB_EXPRESSION` where extended-glob, globstar, brace, and negation expansions are all disabled.
 
-### 7.4 Tag
+### 5.4 Tag
 
 - Pattern: `/^[A-Za-z0-9_-]+$/`, length ≤ 25.
 - At most 3 tags per link, no duplicates within a link.
 - `tagKey` is the lowercased `tagString`.
 
-### 7.5 Description
+### 5.5 Description
 
 - Length ≤ 200, printable ASCII only (`/^[\x20-\x7F]*$/`).
 
-### 7.6 File
+### 5.6 File
 
 - Max single upload size: 20 MiB.
 - Max CSV bulk size: 5 MiB.
 - Allowed extensions (case-insensitive): `avi, bmp, csv, docx, dwf, dwg, dxf, gif, jpeg, jpg, mpeg, mpg, ods, pdf, png, pptx, rtf, tif, tiff, txt, xlsx, zip`.
 - MIME type MUST be detected by inspecting the file's byte content (i.e., magic-number sniffing) rather than trusting client-supplied MIME headers. If sniffing yields no result, fall back to the filename extension. The following extensions MUST be mapped manually because magic-number sniffing does not yield a useful MIME for them: `csv → text/csv`, `dwf → application/x-dwf`, `dxf → application/dxf`.
 
-### 7.7 Constants
+### 5.7 Constants
 
 | Constant | Value |
 |----------|-------|
@@ -380,9 +208,9 @@ Validation is centralized in `src/shared/util/validation.ts` and MUST apply on b
 
 ---
 
-## 8. Authentication and Session Management
+## 6. Authentication and Session Management
 
-### 8.1 OTP Login Flow
+### 6.1 OTP Login Flow
 
 Authentication is one-factor via email-delivered one-time password. Three endpoints participate:
 
@@ -400,7 +228,7 @@ Server behavior:
 2. Generate a 6-digit numeric OTP using cryptographic randomness.
 3. Hash the OTP with a slow, salted password-hashing function (e.g. bcrypt, scrypt, Argon2) using a deployment-wide work factor — see `SALT_ROUNDS` for the bcrypt-equivalent setting.
 4. Store `{ hashedOtp, retries: 3 }` in the OTP cache at key `${email}:${ip}` with TTL `OTP_EXPIRY`.
-5. Send the unhashed OTP to the supplied email via the configured email transport (§20). The email body MUST include the OTP, the requester's IP, and the deployment's display name.
+5. Send the unhashed OTP to the supplied email via the configured email transport (§18). The email body MUST include the OTP, the requester's IP, and the deployment's display name.
 6. On success, return `200 { message: "OTP generated and sent." }` and increment `OTP_GENERATE_SUCCESS`. On transport failure, increment `OTP_GENERATE_FAILURE` and return 500.
 
 **`POST /api/login/verify`** — verifies an OTP.
@@ -422,7 +250,7 @@ Server behavior:
 
 **`GET /api/login/emaildomains`** returns the configured email glob to the client; **`GET /api/login/message`** returns `LOGIN_MESSAGE`.
 
-### 8.2 API Key Authentication
+### 6.2 API Key Authentication
 
 API keys authenticate the external REST API. Key structure: `${apiEnv}_${apiKeyVersion}_${randomSuffix}`.
 
@@ -444,7 +272,7 @@ API key verification:
 
 Admin-only routes additionally require the authenticated user's email to be present in `ADMIN_API_EMAILS`; failure returns 401.
 
-### 8.3 Session Management
+### 6.3 Session Management
 
 Authenticated sessions associate a session token (carried as a cookie) with the principal `{ user: { id, email } }`. The session store technology is implementation-defined; it MUST:
 
@@ -452,7 +280,7 @@ Authenticated sessions associate a session token (carried as a cookie) with the 
 - Allow per-session TTL of `COOKIE_MAX_AGE`.
 - Support explicit destruction on logout.
 
-Cookie attributes are listed in §6.4. The session cookie name is implementation-defined (the existing implementation uses `gogovsg`).
+Cookie attributes are listed in §4.1. The session cookie name is implementation-defined (the existing implementation uses `gogovsg`).
 
 **`GET /api/logout`** destroys the current session and returns `200 { message: "Logged out" }`.
 
@@ -460,21 +288,21 @@ A session guard MUST reject requests lacking an authenticated session with 401, 
 
 ---
 
-## 9. Short URL Lifecycle
+## 7. Short URL Lifecycle
 
-### 9.1 Creation (`POST /api/user/url`)
+### 7.1 Creation (`POST /api/user/url`)
 
 Authentication: session.
 
 Multipart accepted (file upload) or JSON. Validation:
 
 ```
-shortUrl: string (required, §7.1)
+shortUrl: string (required, §5.1)
 longUrl?: string  // XOR with file
 file?: UploadedFile
-tags?: string[]   // each per §7.4
-description?: string (per §7.5)
-contactEmail?: string (per §7.3)
+tags?: string[]   // each per §5.4
+description?: string (per §5.5)
+contactEmail?: string (per §5.3)
 ```
 
 Exactly one of `longUrl` or `file` MUST be supplied. Multiple files MUST return 422.
@@ -484,9 +312,9 @@ Middleware chain:
 1. Multipart upload acceptance with `MAX_FILE_UPLOAD_SIZE` limit.
 2. Form-data preprocessing: place the file under a known request field; parse the `tags` JSON if it is a string.
 3. Single-file check: exactly one file may be present (or none).
-4. File extension/MIME validation (§7.6).
-5. File antivirus scan (§12.2).
-6. URL threat-scan (§12.1).
+4. File extension/MIME validation (§5.6).
+5. File antivirus scan (§10.2).
+6. URL threat-scan (§10.1).
 7. `userController.createUrl`.
 
 Service behavior (`UrlManagementService.createUrl`):
@@ -495,12 +323,12 @@ Service behavior (`UrlManagementService.createUrl`):
 2. `urlRepository.isShortUrlAvailable(shortUrl)` — return 400 `AlreadyExistsError` if taken.
 3. If file, upload to the object store at key `${shortUrl}.${ext}` and store `longUrl = ${file domain}/${shortUrl}.${ext}`; set `isFile = true`.
 4. Insert `urls` row (in a transaction, so `afterCreate` writes `url_clicks` row and `url_history` row).
-5. Associate tags (upserting `tags` rows via §13.4 logic, attaching through `url_tag`).
+5. Associate tags (upserting tag entities per §7.7).
 6. `safeBrowsingExpiry = now + DEFAULT_URL_SCAN_RESULT_EXPIRY_SECONDS` if the URL was scanned clean.
 7. Emit `SHORTLINK_CREATE` with tags `source` and `isfile`.
 8. Return the persisted `StorableUrl`.
 
-### 9.2 Update (`PATCH /api/user/url`)
+### 7.2 Update (`PATCH /api/user/url`)
 
 Authentication: session. Validation:
 
@@ -526,11 +354,11 @@ Service behavior:
 8. Persist update (in transaction → `afterUpdate` hook writes history).
 9. Return updated `StorableUrl`.
 
-### 9.3 Ownership Transfer (`PATCH /api/user/url/ownership`)
+### 7.3 Ownership Transfer (`PATCH /api/user/url/ownership`)
 
 ```
 shortUrl: string (required)
-newUserEmail: string (required, per §7.3)
+newUserEmail: string (required, per §5.3)
 ```
 
 1. Verify current user owns `shortUrl`. Return 400 `AlreadyOwnLinkError` if `newUserEmail` equals the current user's email.
@@ -538,13 +366,13 @@ newUserEmail: string (required, per §7.3)
 3. Update `urls.userId` (transaction, history hook fires).
 4. Send notification email to the new owner.
 
-### 9.4 Deactivation
+### 7.4 Deactivation
 
-There is no explicit user-facing delete. Setting `state = INACTIVE` removes the link from redirects. The system MAY also auto-deactivate via §12.1.5 (malicious-link detection at redirect time).
+There is no explicit user-facing delete. Setting `state = INACTIVE` removes the link from redirects. The system MAY also auto-deactivate via §10.1.5 (malicious-link detection at redirect time).
 
-### 9.5 Listing (`GET /api/user/url`)
+### 7.5 Listing (`GET /api/user/url`)
 
-This endpoint is consumed only by the SPA (§18.5). It is **not** part of the External REST API and MAY be redesigned during a rewrite (see §27.6). The shape below describes the current implementation.
+This endpoint is consumed only by the SPA (§16.5). It is **not** part of the External REST API and MAY be redesigned during a rewrite (see §21.6). The shape below describes the current implementation.
 
 Parameters are read from the query string.
 
@@ -561,7 +389,7 @@ tags?:          string   // semicolon-separated; default ''
 
 Returns `{ urls: StorableUrl[], count: number }`. Search uses case-insensitive substring match on `shortUrl` and `longUrl`; tags filter uses case-insensitive wildcard matching against the comma-/semicolon-separated `tagStrings` representation.
 
-### 9.6 Tag Autocomplete (`GET /api/user/tag`)
+### 7.6 Tag Autocomplete (`GET /api/user/tag`)
 
 ```
 searchText: string (required, length ≥ MIN_TAG_SEARCH_LENGTH, valid tag form)
@@ -570,7 +398,7 @@ limit: int (required)
 
 Returns `string[]` — tagStrings whose `tagKey` matches `${searchText}%` on the user's own URLs.
 
-### 9.7 Tag Upsert (Transactional)
+### 7.7 Tag Upsert (Transactional)
 
 When a write supplies tags, the server MUST:
 
@@ -580,13 +408,13 @@ When a write supplies tags, the server MUST:
 
 ---
 
-## 10. Redirect Service
+## 8. Redirect Service
 
-### 10.1 Request Path
+### 8.1 Request Path
 
 Route: `GET /:shortUrl`. The endpoint accepts a short URL slug matching `[a-zA-Z0-9-]+`.
 
-Two behaviors of this endpoint are **externally binding** because they affect resolution of links already published in the wild (see §27.2):
+Two behaviors of this endpoint are **externally binding** because they affect resolution of links already published in the wild (see §21.2):
 
 - **Trailing-character tolerance**: the captured slug MAY be followed by a single trailing non-slug character (e.g., a `.` appended by an SMS or email client). `/foo.` MUST resolve to the same short URL as `/foo`. The path-matching mechanism is implementation-defined; only the resolution behavior is normative.
 - **Case-insensitive lookup**: `/Foo`, `/FOO`, and `/foo` MUST resolve identically. The existing implementation lowercases the captured slug before cache and database lookup. Stored `shortUrl` values in the canonical deployment are effectively lowercase.
@@ -597,7 +425,7 @@ The redirect handler renders the transition page from a server-side template. Th
 
 The current implementation uses a signed visit-tracking cookie (conventionally named `visits`) to suppress the transition page on repeat visits. The cookie name and the mechanism are implementation details; a rewrite may use a different scheme or no mechanism at all.
 
-### 10.2 Resolution Algorithm
+### 8.2 Resolution Algorithm
 
 ```
 function redirectFor(shortUrl, pastVisits, userAgent, referrer):
@@ -624,60 +452,47 @@ function redirectFor(shortUrl, pastVisits, userAgent, referrer):
 
 DB lookup MUST use the replica when `FF_USE_REPLICA_FOR_REDIRECTS=true`, falling back to primary on replica error.
 
-### 10.3 Response
+### 8.3 Response
 
 - `RedirectType.Direct`: HTTP 302 with `Location: longUrl`.
 - `RedirectType.TransitionPage`: HTTP 200 rendering `transition-page.ejs` with `escapedLongUrl`, `rootDomain` of the destination, and `gaTrackingId`.
 
-Both response paths MUST update `visits` cookie and trigger the side effects in §10.5 and §10.6.
+Both response paths MUST update the visit-tracking cookie and trigger the side effects in §8.5.
 
-### 10.4 Crawler and Referrer Heuristics
+### 8.4 Crawler and Referrer Heuristics
 
 `isCrawler(userAgent)`: parse the user-agent string; if any of the standard fields (browser name, rendering-engine name, OS name) is missing → crawler. Any user agent whose name matches the bot regex `/bot|facebookexternalhit|Facebot|Slackbot|TelegramBot|WhatsApp|Twitterbot|Pinterest|Postman|url|Google-PageRenderer/` MUST be classified as device `'others'` for statistics purposes.
 
 `fromTrustedReferrer(referrer)`: parse the referrer; trusted iff its origin equals `OG_URL`'s origin. Parse failures are treated as untrusted.
 
-### 10.5 Click Statistics Update
+### 8.5 Side Effects
 
-After producing the redirect response (but possibly before returning to the client), the server MUST fire-and-forget a click-recording operation that, atomically and idempotently under concurrency, performs the following four updates for the resolved `shortUrl`:
+Each non-crawler redirect MUST record a click against the resolved short URL. The recording covers four aggregates — a total counter, a device-class counter (mobile / tablet / desktop / others, derived from the user agent), a per-day counter, and a per-(weekday, hour) counter. The day/weekday/hour dimensions MUST be expressed in **Asia/Singapore** local time. Click recording MUST NOT block the redirect response; failures to record MUST NOT cause user-visible errors.
 
-1. Increment the total-clicks counter by 1.
-2. Increment the appropriate device-class counter by 1 (`mobile` / `tablet` / `desktop` / `others`), where the class is derived from the user agent (§10.4).
-3. Increment the (shortUrl, today's date) counter in the daily aggregate by 1.
-4. Increment the (shortUrl, weekday, hour) counter in the weekday/hour aggregate by 1.
-
-All four updates MUST be observed in **Asia/Singapore** local time. The implementation MAY achieve atomicity through a stored procedure with locking, a single transaction with upserts, a single record with multiple counters, or any other mechanism. Errors MUST be caught and logged but MUST NOT block the redirect response.
-
-### 10.6 Web Analytics Pageview
-
-When `GA_TRACKING_ID` (or the equivalent web-analytics property identifier) is configured, the server SHOULD record a pageview event for each non-crawler redirect via the configured web-analytics service. The event SHOULD carry the short URL, long URL, and a stable visitor identifier propagated through a cookie. Crawlers MUST be excluded. The web-analytics integration is optional; absence of it MUST NOT change redirect behavior.
-
-### 10.7 Cookie Eviction
-
-The `visits` cookie holds an array of recent short URLs. Visiting a known short URL MUST move it to the end; unknown short URLs MUST be appended. When the serialized cookie size exceeds `COOKIE_SESSION_MAX_SIZE_BYTES` (default 2000), entries MUST be removed from the head (LRU).
+When web analytics is configured, each non-crawler redirect SHOULD also be reported to the analytics service. Crawler redirects MUST be excluded from both click counts and analytics.
 
 ---
 
-## 11. File Hosting
+## 9. File Hosting
 
 Files attached to short URLs are stored in the object store under the bucket/container identified by `AWS_S3_BUCKET`:
 
 - Object key: `${shortUrl}.${ext}`.
 - ACL: public-read when `state = ACTIVE`, private when `state = INACTIVE`. Cache-Control on uploaded objects is `no-cache`.
 - `longUrl` for a file URL MUST be constructed as `${fileURLPrefix}${AWS_S3_BUCKET}/${key}`.
-  - In production, `fileURLPrefix = 'https://'`, so the URL is `https://${AWS_S3_BUCKET}/${shortUrl}.${ext}`. The bucket name is conventionally also the public hostname (e.g., `file.go.gov.sg`), making the canonical file URL `https://${FILE_HOSTNAME}/${shortUrl}.${ext}`. **External integrators and stored history depend on this URL shape; see §27.3.**
+  - In production, `fileURLPrefix = 'https://'`, so the URL is `https://${AWS_S3_BUCKET}/${shortUrl}.${ext}`. The bucket name is conventionally also the public hostname (e.g., `file.go.gov.sg`), making the canonical file URL `https://${FILE_HOSTNAME}/${shortUrl}.${ext}`. **External integrators and stored history depend on this URL shape; see §21.3.**
   - In development, `fileURLPrefix` is the local object-store emulator's `ACCESS_ENDPOINT` followed by `/`.
 - The reverse derivation `getKeyFromLongUrl(longUrl)` MUST extract the key as the final path segment.
-- Files MUST pass the extension/MIME and antivirus checks of §12.2 before upload.
+- Files MUST pass the extension/MIME and antivirus checks of §10.2 before upload.
 - Replacing a file (on edit) MUST overwrite the same key. The system MUST NOT permit changing whether a URL is a file URL after creation, nor changing its `longUrl` independently of the underlying object.
 
 For development, a local object-store emulator MAY be exposed at `BUCKET_ENDPOINT`.
 
 ---
 
-## 12. Threat Detection
+## 10. Threat Detection
 
-### 12.1 URL Threat Scanning
+### 10.1 URL Threat Scanning
 
 The server integrates with an external **URL threat-scanning service** that, given a URL, returns whether the URL is known to host malware, social-engineering content, unwanted software, or related threats. The choice of provider is implementation-defined; the configuration uses `SAFE_BROWSING_KEY` as a generic credential. The integration MUST cover the conceptual threat classes:
 
@@ -686,33 +501,33 @@ The server integrates with an external **URL threat-scanning service** that, giv
 - unwanted software
 - extended-coverage social engineering (lower-confidence phishing detection)
 
-#### 12.1.1 Cache
+#### 10.1.1 Cache
 
 Threat-scan results MUST be cached by URL with a short TTL (default 300 s). Cache hits return the cached threat verdict; cache misses query the external service. The cache is logically separate from the redirect cache and other caches.
 
-Additionally, the *clean* verdict MUST be cached on the `Url` itself via `safeBrowsingExpiry` (default 24 h) so that the redirect path (§10.2) avoids re-scanning on every hit.
+Additionally, the *clean* verdict MUST be cached on the `Url` itself via `safeBrowsingExpiry` (default 24 h) so that the redirect path (§8.2) avoids re-scanning on every hit.
 
-#### 12.1.2 When the service is unconfigured
+#### 10.1.2 When the service is unconfigured
 
 If no threat-scanning credential is configured, the server MUST log a warning at startup and treat all URLs as clean. Threat scanning is OPTIONAL infrastructure.
 
-#### 12.1.3 Log-only mode
+#### 10.1.3 Log-only mode
 
 When `SAFE_BROWSING_LOG_ONLY=true`, a detected threat MUST be logged and the `MALICIOUS_ACTIVITY_LINK` counter incremented, but the verdict returned to callers MUST be "clean". This mode permits dry-run deployment of the scanner.
 
-#### 12.1.4 Bulk scan
+#### 10.1.4 Bulk scan
 
 A bulk scan over an array of URLs MUST evaluate each URL (concurrency permitted) and return true if any URL is a threat. Implementations MAY short-circuit on the first positive.
 
-#### 12.1.5 At redirect
+#### 10.1.5 At redirect
 
-§10.2 specifies that an expired `safeBrowsingExpiry` triggers a re-scan and that a threat-positive scan MUST:
+§8.2 specifies that an expired `safeBrowsingExpiry` triggers a re-scan and that a threat-positive scan MUST:
 
 - Deactivate the link (`state = INACTIVE`).
 - Email the owner.
 - Return 404 to the caller (parity with not-found, avoiding leakage).
 
-### 12.2 File Threat Scanning
+### 10.2 File Threat Scanning
 
 The server integrates with an external **antivirus service** that, given a file's bytes, returns whether the file contains a virus or is password-protected. The choice of provider is implementation-defined; the configuration uses `CLOUDMERSIVE_KEY` as a generic credential. The scanner SHOULD be configured to refuse executables, scripts, and structurally invalid files.
 
@@ -723,19 +538,19 @@ File scan pipeline:
 3. If the file is password-protected, return 400 `"Cannot upload password-protected files."`.
 4. If the file contains a virus, emit `MALICIOUS_ACTIVITY_FILE` and return 400 `"File is likely to be malicious."`.
 
-### 12.3 File Extension/MIME Validation
+### 10.3 File Extension/MIME Validation
 
 Before invoking the antivirus service, the server MUST:
 
-1. Detect the file's MIME type from its byte content (not from the upload's declared header); fall back to the filename extension; apply the manual overrides in §7.6.
-2. Reject the upload with 415 `"File type disallowed."` if the resolved extension is empty or not in the allowlist (default §7.6).
+1. Detect the file's MIME type from its byte content (not from the upload's declared header); fall back to the filename extension; apply the manual overrides in §5.6.
+2. Reject the upload with 415 `"File type disallowed."` if the resolved extension is empty or not in the allowlist (default §5.6).
 3. Stamp the resolved MIME on the in-flight upload record so downstream consumers (object-store upload, antivirus call) see the canonical type.
 
 ---
 
-## 13. Bulk Operations and Async Jobs
+## 11. Bulk Operations and Async Jobs
 
-### 13.1 Bulk Upload (`POST /api/user/url/bulk`)
+### 11.1 Bulk Upload (`POST /api/user/url/bulk`)
 
 Multipart upload. File size ≤ `MAX_CSV_UPLOAD_SIZE` (5 MiB). Optional `tags` JSON.
 
@@ -744,19 +559,19 @@ Pipeline:
 1. Multipart upload acceptance with `MAX_CSV_UPLOAD_SIZE` limit.
 2. File extension/MIME validation restricted to `csv`.
 3. File antivirus scan.
-4. Parse and validate the CSV per §13.1.1–§13.1.2.
-5. URL threat-scan on every parsed URL (bulk variant; §12.1.4).
+4. Parse and validate the CSV per §11.1.1–§11.1.2.
+5. URL threat-scan on every parsed URL (bulk variant; §10.1.4).
 6. Generate short URLs and persist the bulk URL mappings.
-7. If `ACTIVATE_BULK_QR_CODE_GENERATION === 'true'`, dispatch the async-job pipeline (§13.2).
+7. If `ACTIVATE_BULK_QR_CODE_GENERATION === 'true'`, dispatch the async-job pipeline (§11.2).
 
-#### 13.1.1 CSV format
+#### 11.1.1 CSV format
 
 - Header row MUST be exactly `BULK_UPLOAD_HEADER = "Original links to be shortened"`.
 - One column per row.
 - Empty rows skipped.
 - Rows ≤ `BULK_UPLOAD_MAX_NUM` (default 1000).
 
-#### 13.1.2 Row-level validation
+#### 11.1.2 Row-level validation
 
 Apply in order. Any failure aborts the upload with HTTP 400 and `MessageType.FileUploadError`. Each failure emits `BULK_VALIDATION_ERROR` with the corresponding tag:
 
@@ -771,11 +586,11 @@ Apply in order. Any failure aborts the upload with HTTP 400 and `MessageType.Fil
 | `not isCircularRedirects(row, OG_URL.hostname)` | `isNotCircularRedirect` | `"Row {N}: {url} redirects back to {host}"` |
 | No CSV-parser error | `noParsingError` | `"Parsing error"` |
 
-#### 13.1.3 Short URL generation
+#### 11.1.3 Short URL generation
 
 For each accepted long URL, call `generateShortUrl(BULK_UPLOAD_RANDOM_STR_LENGTH)`. Collision detection runs inside `UrlManagementService.bulkCreate`.
 
-#### 13.1.4 Persistence
+#### 11.1.4 Persistence
 
 `UrlManagementService.bulkCreate({ userId, urlMappings, tags })`:
 
@@ -784,7 +599,7 @@ For each accepted long URL, call `generateShortUrl(BULK_UPLOAD_RANDOM_STR_LENGTH
 - Apply the supplied tags to all rows.
 - The `afterBulkCreate` hook MUST write `url_history` rows and create `url_clicks` rows.
 
-#### 13.1.5 Response
+#### 11.1.5 Response
 
 ```
 200 { count: number, job?: Job }
@@ -792,67 +607,29 @@ For each accepted long URL, call `generateShortUrl(BULK_UPLOAD_RANDOM_STR_LENGTH
 
 `job` is present iff QR generation was enabled.
 
-### 13.2 Job lifecycle
+### 11.2 Job model
 
-When the bulk pipeline produces a job:
+A bulk upload that requests QR generation produces a **job** with a stable UUID and a `status` of `IN_PROGRESS`, `SUCCESS`, or `FAILURE`. The job is decomposed into one or more **job items**, each carrying a chunk of mappings (default `BULK_QR_CODE_BATCH_SIZE = 1000`) and a stable `jobItemId` of the form `${job.uuid}/${batchIndex}`. The `jobItemId` is used as the artifact key in object storage, so re-running an item produces the same paths.
 
-1. Create a `Job` record with status `IN_PROGRESS` and a fresh UUID.
-2. Chunk `urlMappings` into batches of size `BULK_QR_CODE_BATCH_SIZE` (default 1000).
-3. For each batch with index `i`:
-   - Create a `JobItem` with `jobItemId = "${job.uuid}/${i}"`, status `IN_PROGRESS`, empty `message`, and `params = { jobItemId, mappings }`.
-   - Enqueue the same `params` payload onto the async job queue (§3.1). The queue MUST deliver the message to a background worker at least once; duplicate delivery MUST be tolerated by the worker (the artifact key is deterministic on `jobItemId`).
+A job's aggregate status is derived from its items: `FAILURE` if any item failed, `IN_PROGRESS` if any item is still running, `SUCCESS` otherwise. When a job leaves `IN_PROGRESS`, the server MUST notify the owner by email.
 
-Emit `JOB_START_SUCCESS` or `JOB_START_FAILURE` per item.
+### 11.3 Job status polling
 
-### 13.3 Job status aggregation
+**`GET /api/user/job/status?jobId={id}`** (session) — long poll. The server waits up to `JOB_POLL_ATTEMPTS × JOB_POLL_INTERVAL` for the job to leave `IN_PROGRESS`. On a terminal status it returns:
 
 ```
-function computeJobStatus(items):
-    if any item.status == FAILURE: return FAILURE
-    if any item.status == IN_PROGRESS: return IN_PROGRESS
-    return SUCCESS
+{ job: { id, uuid, status, ... }, jobItemUrls: string[] }
 ```
 
-When a job transitions out of `IN_PROGRESS`, the server MUST send a completion email to the owner. Emit `JOB_EMAIL_SUCCESS`/`JOB_EMAIL_FAILURE`.
-
-### 13.4 Job callback (`POST /api/callback/qr`)
-
-Admin API-key authenticated.
-
-Request body:
-
-```
-{ userId: number, jobItemId: string, status: { isSuccess: boolean, errorMessage?: string } }
-```
-
-Server:
-
-1. `JobManagementService.updateJobItemStatus(jobItemId, status)`. Emit `JOB_ITEM_UPDATE_*`.
-2. `updateJobStatus(jobId)` — recompute parent status and persist. Emit `JOB_UPDATE_*`.
-3. If parent transitioned to a terminal status, send the completion email and include the per-item download URLs `${BULK_QR_CODE_BUCKET_URL}/${jobItemId}`.
-
-### 13.5 Job status polling
-
-**`GET /api/user/job/status?jobId={id}`** (session) — long poll:
-
-```
-for attempt in 1..JOB_POLL_ATTEMPTS:
-    job = repository.findJobForUser(userId, jobId)
-    if job is null: return 404
-    if job.status != IN_PROGRESS: return 200 { job, jobItemUrls }
-    sleep JOB_POLL_INTERVAL ms
-return 408
-```
-
-`jobItemUrls = job.items.map(i => `${BULK_QR_CODE_BUCKET_URL}/${i.jobItemId}`)`.
+where `jobItemUrls` is one URL per item, derived from the artifact key. On poll exhaustion it responds 408.
 
 **`GET /api/user/job/latest`** returns the latest job for the user without long-polling.
 
 ---
 
-## 14. QR Code Generation
+## 12. QR Code Generation
 
-### 14.1 Single-URL Endpoint (`GET /api/qrcode`)
+### 12.1 Single-URL Endpoint (`GET /api/qrcode`)
 
 Query parameters:
 
@@ -867,7 +644,7 @@ Behavior:
 2. Construct the full URL `${OG_URL}/${shortUrl}`.
 3. Render with the `qrcode` library:
    - SVG output, error correction level `H`, margin 0.
-   - Dark color from the deployment's brand color (§14.3).
+   - Dark color from the deployment's brand color (§12.3).
 4. Compose onto a 1000-pixel-wide canvas:
    - 85 px top margin.
    - 800×800 QR centered.
@@ -878,9 +655,9 @@ Behavior:
 5. If `format` is `image/png` or `image/jpeg`, rasterize the rendered canvas to the target format.
 6. Respond with the correct `Content-Type` and header `Filename: ${OG_URL_HOST}/${shortUrl}`. Body is the binary buffer.
 
-### 14.2 Bulk QR Pipeline
+### 12.2 Bulk QR Pipeline
 
-Enabled iff `ACTIVATE_BULK_QR_CODE_GENERATION === 'true'`. See §13.2 for the dispatch protocol and Appendix A for the background-worker contract.
+Enabled iff `ACTIVATE_BULK_QR_CODE_GENERATION === 'true'`. See §11.2 for the dispatch protocol.
 
 For each `jobItemId = "${job.uuid}/${i}"`, the worker produces three artifacts in the object store under the prefix `${jobItemId}/`:
 
@@ -888,15 +665,15 @@ For each `jobItemId = "${job.uuid}/${i}"`, the worker produces three artifacts i
 - `${jobItemId}/generated_svg.zip` — `${shortUrl}.svg` per mapping.
 - `${jobItemId}/generated_png.zip` — `${shortUrl}.png` per mapping.
 
-### 14.3 Color and Logo
+### 12.3 Color and Logo
 
-QR codes MUST be rendered with a single brand dark color and a single brand logo, both implementation-defined. The chosen color and logo are deployment-wide constants. Both the synchronous QR-code endpoint (§14.1) and the bulk-generation worker (§14.2, Appendix A.3) MUST use the same color and logo so that a single QR rendered ad hoc is visually indistinguishable from one rendered as part of a bulk job.
+QR codes MUST be rendered with a single brand dark color and a single brand logo, both implementation-defined. The chosen color and logo are deployment-wide constants. Both the synchronous QR-code endpoint (§12.1) and the bulk-generation pipeline (§12.2) MUST use the same color and logo so that a single QR rendered ad hoc is visually indistinguishable from one rendered as part of a bulk job.
 
 ---
 
-## 15. Statistics and Analytics
+## 13. Statistics and Analytics
 
-### 15.1 Global Statistics (`GET /api/stats`)
+### 13.1 Global Statistics (`GET /api/stats`)
 
 Public, unauthenticated. Returns static counters from environment:
 
@@ -906,7 +683,7 @@ Public, unauthenticated. Returns static counters from environment:
 
 These values do not refresh dynamically; they are updated by redeploy.
 
-### 15.2 Per-Link Statistics (`GET /api/link-stats`)
+### 13.2 Per-Link Statistics (`GET /api/link-stats`)
 
 Session-authenticated. Query:
 
@@ -935,19 +712,11 @@ Server:
 }
 ```
 
-### 15.3 Click Aggregation
-
-Per §10.5, every successful redirect MUST invoke the click-recording operation. That operation MUST be idempotent and safe under concurrent invocation for the same short URL.
-
-### 15.4 Web Analytics Hits
-
-§10.6. When web analytics is configured, the server MAY assign a stable visitor identifier via a cookie and propagate it across redirects; absence of the cookie SHOULD cause a fresh identifier to be issued.
-
 ---
 
-## 16. Audit Trail (Link History)
+## 14. Audit Trail (Link History)
 
-### 16.1 Endpoint (`GET /api/link-audit`)
+### 14.1 Endpoint (`GET /api/link-audit`)
 
 Session-authenticated. Query:
 
@@ -959,7 +728,7 @@ limit?:  int (default 10)
 
 The user MUST own the link; otherwise return 404 `"User does not own this short url"`.
 
-### 16.2 Algorithm
+### 14.2 Algorithm
 
 1. Fetch the last `limit + 1 + offset` `url_history` rows ordered by `updatedAt DESC`.
 2. Compute change sets pairwise:
@@ -975,9 +744,9 @@ Change sets MUST be ordered newest first.
 
 ---
 
-## 17. Public Directory Search
+## 15. Public Directory Search
 
-### 17.1 Endpoint (`GET /api/directory/search`)
+### 15.1 Endpoint (`GET /api/directory/search`)
 
 Public; **does** require a session in the current implementation. Query:
 
@@ -991,17 +760,17 @@ isFile?: 'true' | 'false' | '' (empty == any)
 isEmail: 'true' | 'false' (required)
 ```
 
-### 17.2 Query Modes
+### 15.2 Query Modes
 
 - **Email mode** (`isEmail === 'true'`): the `query` is interpreted as an email or email substring. The query MUST be reduced to the part after `@` if present. The server performs a case-insensitive substring match against `User.email`. Emit `DIRECTORY_SEARCH_EMAIL`.
 - **Text mode** (`isEmail === 'false'`): `@` MUST be stripped from the query to avoid leaking email-domain enumeration through this path. The server performs a full-text search against `Url` fields using English-language tokenization, with weighted relevance: `shortUrl` matches rank highest, `longUrl` matches medium, `description` matches lowest. The exact weight values are implementation-defined; what matters is the *ordering*. Emit `DIRECTORY_SEARCH_DOMAIN`.
 
-### 17.3 Sort
+### 15.3 Sort
 
 - `POPULARITY` → results ordered by total-clicks aggregate (descending).
 - `RECENCY` → results ordered by `Url.createdAt` (descending).
 
-### 17.4 Response
+### 15.4 Response
 
 ```
 {
@@ -1012,212 +781,123 @@ isEmail: 'true' | 'false' (required)
 
 ---
 
-## 18. Client Application
+## 16. Client Application
 
-The browser client is a single-page application served as a static bundle. Framework choice (React, Vue, Svelte, etc.), state-management approach, routing strategy (hash, history, path-based), and UI toolkit are implementation-defined. All client behaviors described here MUST be reproducible regardless of visual styling. State-shape descriptions in this section are derived from the current implementation; they document the *information* the client holds, not a required data structure.
+The browser client is a single-page application. Internal framework choice, state management, routing strategy, and UI toolkit are implementation-defined. The behaviors below are the functional contract.
 
-### 18.1 Routes
+### 16.1 Routes
 
 | Path | Subapp | Access | Behavior |
 |------|--------|--------|----------|
 | `/` | home | anonymous | If logged in, redirect to `/user`. Otherwise render landing. |
 | `/login` | login | anonymous | If logged in, redirect to `/user`. |
-| `/user` | user dashboard | authenticated | Private route; if anonymous, redirect to `/login` and remember the originally-requested location. |
+| `/user` | user dashboard | authenticated | If anonymous, redirect to `/login` and remember the originally-requested location. |
 | `/directory` | directory | public | Public search. |
 | `/apiintegration` | API integration | authenticated | Private route. |
 | `/404/:shortUrl` | 404 | public | "Link not found" page. |
 
-Private routes MUST be guarded so anonymous users are redirected to `/login`. After a successful OTP verification, the login subapp MUST navigate back to the originally-requested location if one was remembered, else `/user`.
+After a successful OTP verification, the login subapp navigates back to the originally-requested location if one was remembered, else `/user`.
 
-### 18.2 Global Layout
+### 16.2 Cross-Cutting Behavior
 
-Across all subapps, the client MUST:
+- Every page mount fires a web-analytics page-view event when web analytics is configured.
+- A global notification surface displays transient error, success, and info messages.
+- All API requests include credentials and are sent same-origin.
+- The login page displays `LOGIN_MESSAGE` when present; the dashboard displays `USER_MESSAGE` when present.
 
-- On every page mount, fire a web-analytics page-view event when web analytics is configured. Page titles are implementation-defined; the existing app uses labels like `HOME PAGE`, `EMAIL LOGIN PAGE`, `OTP LOGIN PAGE`, `USER PAGE`, `CREATE LINK PAGE`, `DIRECTORY PAGE`, `API INTEGRATION`.
-- Render a global notification surface (toast/snackbar) capable of displaying transient error, success, and info messages, with a programmatic API to enqueue and dismiss them.
-- Send all API requests with credentials included and same-origin mode. The HTTP client implementation is unspecified.
-- Request a `LOGIN_MESSAGE` banner on the login page and a `USER_MESSAGE` banner on the dashboard, displaying each when non-empty.
+### 16.3 Home
 
-### 18.3 Home Subapp
+On mount: check session via `GET /api/login/isLoggedIn` (navigate to `/user` if logged in), fetch rotating-link payload via `GET /api/links`, and fetch landing-page counters via `GET /api/stats`.
 
-Information held: optional rotating-links list and `{ userCount, linkCount, clickCount }`.
+### 16.4 Login
 
-On mount:
-
-1. `GET /api/login/isLoggedIn` — if 200, navigate to `/user`.
-2. `GET /api/links` — server returns rotating-link payload (string sourced from `ROTATED_LINKS`).
-3. `GET /api/stats` — populate the statistics counters on the landing page.
-
-### 18.4 Login Subapp
-
-Information held: the email being entered, an email validator function, the currently authenticated user (if any), and a form-state value drawn from the set:
+The login form moves through five states: **email-ready**, **email-pending**, **OTP-ready**, **OTP-pending**, **resend-disabled**.
 
 ```
-EMAIL_READY | EMAIL_PENDING | OTP_READY | OTP_PENDING | RESEND_OTP_DISABLED
+email-ready  --submit-> email-pending --ok-> OTP-ready
+                                     --err-> email-ready (error toast)
+OTP-ready    --submit-> OTP-pending   --ok-> logged-in (navigate to /user)
+                                     --err-> OTP-ready  (error toast)
+OTP-ready    --resend-> email-pending -> OTP-ready -> resend-disabled (20 s) -> OTP-ready
 ```
 
-State machine:
+On mount the client fetches `GET /api/login/isLoggedIn` and `GET /api/login/emaildomains`, then constructs an email validator that combines a glob match against the returned pattern with a structural email check (§5.3).
 
-```
-EMAIL_READY --submit-> EMAIL_PENDING --resp.ok-> OTP_READY
-                                  --resp.err-> EMAIL_READY (error toast)
-OTP_READY   --submit-> OTP_PENDING   --resp.ok-> logged-in (navigate to /user)
-                                  --resp.err-> OTP_READY (error toast)
-OTP_READY   --resend-> EMAIL_PENDING -> OTP_READY -> RESEND_OTP_DISABLED (20 s) -> OTP_READY
-```
+The email input is lowercased on every keystroke. The error message `"This doesn't look like a valid ${domain} email."` is shown only when the field has a value that fails the validator. The OTP is not validated client-side beyond non-emptiness.
 
-Bootstrap fetches:
+### 16.5 User Dashboard
 
-1. `GET /api/login/isLoggedIn`. If 200, mark the session authenticated; if 404, mark it anonymous.
-2. `GET /api/login/emaildomains` — server returns the glob string. The client constructs an email validator that combines a glob match against this string with a structural email check (per §7.3).
+The dashboard lists the signed-in user's links in a table with pagination, sort, filtering, and search. On mount the client fetches the user's URLs (with the current table configuration), the user-message banner, the announcement-modal content, and the latest async-job status.
 
-Validation:
+If the user has no URLs and no filter is active, the client renders an empty state with a "Create link" CTA. Otherwise it renders the table.
 
-- Email input lowercases on every keystroke.
-- Email error message: `"This doesn't look like a valid ${domain} email."` shown only when the field has a value and fails the validator.
-- OTP input is not validated client-side beyond non-emptiness.
+**Table configuration.** The table exposes:
 
-When real-user observability is configured, the client SHOULD identify the authenticated user to it on both bootstrap (existing session) and after successful OTP verification.
+- Page size and current page.
+- A search input (debounced before issuing the request).
+- A tag filter (semicolon-separated) — mutually exclusive with the search input.
+- Optional filters by `isFile` and `state`.
+- Sort by `createdAt` (default) or `clicks`, ascending or descending.
 
-### 18.5 User Dashboard Subapp
+The active configuration is reflected in the URL query string so the page is shareable.
 
-Information held by the dashboard:
+**Create-link modal.** Three modes:
 
-- Whether initial data has been loaded; whether a fetch is in flight.
-- The current page of URLs (`StorableUrl[]`) and the total count.
-- Form inputs for creating a new short URL: short URL, long URL, tags.
-- Whether the create-URL modal is open.
-- A table configuration value with the following dimensions:
+- **URL** — short URL + long URL + optional tags. Submits to `POST /api/user/url` as JSON.
+- **File** — short URL + file + optional tags. Submits to `POST /api/user/url` as multipart.
+- **Bulk** — CSV + optional tags. Submits to `POST /api/user/url/bulk`.
 
-```
-isTag:           boolean        // is the active filter a tag filter?
-numberOfRows:    number         // page size; default 10
-pageNumber:      number         // 0-indexed
-searchText:      string         // user search input
-searchInput:     string         // debounced 500 ms version of searchText
-tags:            string         // semicolon-separated tag filter
-filter:          { isFile?: boolean, state?: 'ACTIVE'|'INACTIVE' }
-orderBy:         string         // default 'createdAt'
-sortDirection:   'asc' | 'desc'
-```
+The long-URL input strips a leading `https://` for display and re-adds it before submission. The short URL is validated against `/^[a-z0-9-]+$/`. Tags are validated per §5.4. Errors are surfaced as toasts categorised by the `MessageType` in the response body.
 
-- The user-message banner and announcement-modal contents.
-- Upload-success and upload-error flags for URL/file creation.
-- Whether a file upload is in flight.
-- The most recently created short URL (for surfacing in the UI).
-- The current page of link-history change sets and its total count.
-- A status-bar message with a header, body, severity (`SUCCESS`, `ERROR`, `INFO`), and a list of related download URLs.
+On bulk success the status bar (below) starts tracking the new job.
 
-#### 18.5.1 Initial Load
+**Link drawer.** Clicking a row opens a drawer with the following features, each mapped to one API call:
 
-On mount, in order:
+| Feature | API |
+|---------|-----|
+| Edit long URL | `PATCH /api/user/url` |
+| Edit description + contact email | `PATCH /api/user/url` |
+| Edit tags | `PATCH /api/user/url` |
+| Replace file | `PATCH /api/user/url` (multipart) |
+| Toggle Active/Inactive | `PATCH /api/user/url` |
+| Transfer ownership | `PATCH /api/user/url/ownership` |
+| View link history | `GET /api/link-audit` |
+| View statistics | `GET /api/link-stats` |
+| Download QR code | `GET /api/qrcode` |
 
-1. Fetch `GET /api/user/url?{tableConfig}` and store `{ urls, count }`.
-2. If the email validator is not cached, fetch `GET /api/login/emaildomains` and build it.
-3. Fetch `GET /api/user/message` to populate the banner.
-4. Fetch `GET /api/user/announcement` to populate the announcement modal.
-5. Fetch `GET /api/user/job/latest` to determine whether a status bar should be displayed.
+**Bulk-QR status bar.** While a bulk job is running, the dashboard polls `GET /api/user/job/status`. Status messages:
 
-If the total URL count is zero and no filters are active, render an empty state with a "Create link" CTA. Otherwise render the URL table.
+- `IN_PROGRESS` (info): `"QR codes generation in progress. Please wait to download your QR codes"`.
+- `SUCCESS`: `"QR codes successfully generated. Please download your QR codes here or via email"`, with per-format download links.
+- `FAILURE`: `"QR codes failed to generate. Please try again"`.
 
-#### 18.5.2 Create Link Modal
+**Announcement modal.** If announcement configuration is present (§4), the dashboard shows a dismissible modal with the configured title, subtitle, image, message, and CTA button on first mount.
 
-Three tabs:
+### 16.6 Directory
 
-- **URL**: fields `shortUrl`, `longUrl`, optional `tags`. On submit: `POST /api/user/url` JSON.
-- **File**: fields `shortUrl`, file picker, optional `tags`. On submit: `POST /api/user/url` multipart.
-- **Bulk**: file picker (CSV ≤ 5 MiB), optional `tags`. On submit: `POST /api/user/url/bulk` multipart.
+Search input is debounced. Each commit updates the page's query string with `query`, `order`, `rowsPerPage`, `currentPage`, `state`, `isFile`, `isEmail`. Any change to those query parameters re-issues `GET /api/directory/search`.
 
-The modal MUST:
+Before sending, the query is lowercased and trimmed. If `isEmail` is true, only the substring after `@` is sent; otherwise `@` characters are stripped entirely (to prevent the text search from leaking email-domain enumeration).
 
-- Strip leading `https://` from the long URL field for display and prepend it back before sending.
-- Validate `shortUrl` against `/^[a-z0-9-]+$/`.
-- Validate tags via `isValidTags`.
-- Show error toasts categorized by `MessageType` returned in the response body.
-- On bulk success, dispatch `getLatestJob()` so the status bar reflects the new job.
+A "Reset filters" action clears all filters but preserves the query and `isEmail` mode and resets pagination to page 0. Changing rows-per-page MUST also reset to page 0.
 
-#### 18.5.3 Link Drawer
+### 16.7 API Integration
 
-Opens by row click. Local context state:
+On mount: `GET /api/user/hasApiKey` to determine whether the user already has a key.
 
-```
-controlPanelIsOpen:    boolean
-relevantShortLink:     string | null
-qrCodeModalIsOpen:     boolean
-uploadFileError:       string | null
-linkHistoryIsActive:   boolean
-```
+"Generate API Key" calls `POST /api/user/apiKey` and displays the returned key in a modal. The full key is shown exactly once; the client MUST NOT persist it.
 
-Drawer features (each maps to an existing API):
+### 16.8 Internationalization
 
-| Feature | Backend |
-|---------|---------|
-| Edit long URL | `PATCH /api/user/url { shortUrl, longUrl }` |
-| Edit description + contact email | `PATCH /api/user/url { shortUrl, description, contactEmail }` |
-| Edit tags | `PATCH /api/user/url { shortUrl, tags }` |
-| Replace file | `PATCH /api/user/url` multipart |
-| Toggle ACTIVE/INACTIVE | `PATCH /api/user/url { shortUrl, state }` (optimistic via `TOGGLE_URL_STATE_SUCCESS`) |
-| Transfer ownership | `PATCH /api/user/url/ownership { shortUrl, newUserEmail }` |
-| View link history | `GET /api/link-audit?url=&offset=&limit=` |
-| View statistics | `GET /api/link-stats?url=&offset=` |
-| Generate QR code | `GET /api/qrcode?url=&format=` |
-
-#### 18.5.4 Bulk QR Status Bar
-
-When a bulk job exists, the status bar polls `GET /api/user/job/status?jobId=` with exponential backoff. Rendering rules:
-
-- `IN_PROGRESS` → INFO variant: `"QR codes generation in progress. Please wait to download your QR codes"`.
-- `SUCCESS` → SUCCESS variant: `"QR codes successfully generated. Please download your QR codes here or via email"`. `callbacks` contains the per-format download URLs constructed from `BULK_QR_CODE_BUCKET_URL`.
-- `FAILURE` → ERROR variant: `"QR codes failed to generate. Please try again"`.
-
-#### 18.5.5 Announcement Modal
-
-If `state.user.announcement` is truthy, the client MUST render a modal at first dashboard mount displaying the configured `title`, `subtitle`, `message`, `image`, and a CTA button labeled `buttonText` linking to `url`. The modal MUST be dismissible.
-
-### 18.6 Directory Subapp
-
-State (`state.directory`):
-
-```
-results:        UrlTypePublic[]
-resultsCount:   number
-queryForResult: string | null
-```
-
-Behavior:
-
-- The query input is debounced 500 ms. Each commit updates the URL search string (`/directory?query=&order=&rowsPerPage=&currentPage=&state=&isFile=&isEmail=`).
-- On any change to the URL search string, the client MUST refetch `GET /api/directory/search`.
-- Query parameters MUST be transformed:
-  - `query.toLowerCase().trim()`.
-  - If `isEmail === 'true'`, retain only the substring after `@`.
-  - Else strip `@` characters entirely.
-- Filter "Reset" clears all filters but preserves the query and `isEmail` mode and resets pagination to page 0.
-- Pagination changes (rows-per-page or page) re-issue the GET with updated parameters; rows-per-page change MUST reset page to 0.
-
-### 18.7 API Integration Subapp
-
-Information held: whether the current user has an API key, whether the key-display modal is open, and the most recently generated API key (transient — held only long enough to show it to the user).
-
-On mount: `GET /api/user/hasApiKey` to populate the "has key" flag.
-
-The "Generate API Key" action calls `POST /api/user/apiKey` (no body) and opens the key-display modal with the returned key. The full key is shown exactly once; the client MUST NOT persist it in long-lived storage.
-
-### 18.8 HTTP Client
-
-The client makes HTTP requests using any library or built-in mechanism. All requests MUST include credentials (so the session cookie is sent) and use same-origin mode. JSON requests MUST send `Content-Type: application/json`; multipart uploads MUST omit `Content-Type` so the runtime can set the boundary automatically.
-
-### 18.9 Internationalization
-
-The client loads a single English locale bundle at startup. The bundle's location and loading mechanism are implementation-defined (the existing implementation places it under `/locales/en/...` and loads it via an i18n library). HTML escaping MUST be performed by the rendering layer, not by the i18n library, so translation values may contain inline HTML safely. The locale schema is in Appendix D.
+The client loads a single English locale bundle at startup. The location of the bundle and the loader library are implementation-defined. HTML escaping MUST be performed by the rendering layer so that translation values may safely contain inline HTML. The locale schema is in Appendix B.
 
 ---
 
-## 19. External REST API (v1)
+## 17. External REST API (v1)
 
-Gated by `FF_EXTERNAL_API === 'true'`. Mounted under `/api/v1`. Authenticated by API key (§8.2).
+Gated by `FF_EXTERNAL_API === 'true'`. Mounted under `/api/v1`. Authenticated by API key (§6.2).
 
-### 19.1 User-scope
+### 17.1 User-scope
 
 | Route | Body / Query |
 |-------|--------------|
@@ -1227,7 +907,7 @@ Gated by `FF_EXTERNAL_API === 'true'`. Mounted under `/api/v1`. Authenticated by
 
 API responses use a thin DTO mapping that omits internal fields (e.g., `safeBrowsingExpiry`, `userId`).
 
-### 19.2 Admin-scope
+### 17.2 Admin-scope
 
 Mounted under `/api/v1/admin/`. Additional middleware: `apiKeyAdminAuthMiddleware`.
 
@@ -1235,13 +915,13 @@ Mounted under `/api/v1/admin/`. Additional middleware: `apiKeyAdminAuthMiddlewar
 |-------|------|
 | `POST /api/v1/admin/urls` | `{ email (target user), longUrl, shortUrl? }`. Server: `findOrCreateWithEmail(email)`; create URL under the target user. If `userId !== targetUser.id`, transfer ownership immediately. |
 
-### 19.3 QR-job callback
+### 17.3 QR-job callback
 
-`POST /api/callback/qr` (admin-scope; §13.4).
+A callback endpoint is exposed under admin scope to allow background workers to report job-item completion. Its exact path, request shape, and authentication are implementation-defined; only the abstract callback contract of §11.2 is normative.
 
 ---
 
-## 20. Email Delivery
+## 18. Email Delivery
 
 A single mailer abstraction sends:
 
@@ -1252,128 +932,43 @@ A single mailer abstraction sends:
 
 The email transport is implementation-defined: any mechanism capable of delivering plain-text or HTML mail to arbitrary recipients is acceptable (transactional email provider, on-prem SMTP, third-party email API). The implementation MAY define a fallback transport that is attempted when the primary transport fails.
 
-Bounce/complaint capture, if supported by the chosen transport, MAY be performed out-of-band by an auxiliary worker that listens for delivery-status notifications (Appendix A.4).
+Bounce/complaint capture, if supported by the chosen transport, MAY be performed out-of-band by an auxiliary worker that listens for delivery-status notifications.
 
 ---
 
-## 21. Persistence and Caching
+## 19. Security Headers and Rate Limiting
 
-### 21.1 Primary durable store
-
-A primary durable store backs the entities of §4. Required behaviors:
-
-- Transactional writes spanning multiple entities (used for URL creation + history + initial clicks-counter row).
-- Secondary indexes sufficient to support the access patterns described in this document, including descending order by total clicks (popularity sort) and a weighted full-text index over (`shortUrl`, `longUrl`, `description`) for directory search.
-- Asia/Singapore time handling for time-dimensioned aggregates.
-- Bulk mutations on `Url` MUST be forbidden so every change passes through the URL-history write (§4.4). Implementations MAY enforce this in the data layer, in a service layer, or both.
-- URL create/update/transfer MUST atomically write a `UrlHistory` record (§4.4). A `Url` create MUST atomically seed the total-clicks aggregate.
-
-A read replica is OPTIONAL. When `FF_USE_REPLICA_FOR_REDIRECTS` is true, the redirect lookup MAY consult the replica; on replica error the primary MUST be queried. All reads outside the redirect path SHOULD prefer the primary unless eventual consistency is explicitly acceptable (directory search, statistics).
-
-### 21.2 Caches
-
-The five logically separate caches of §3.1 have the following key spaces and TTLs:
-
-| Purpose | Key | Value | TTL |
-|---------|-----|-------|-----|
-| OTP | `${email}:${ip}` | `{ hashedOtp, retries }` | `OTP_EXPIRY` (default 300 s) |
-| Session | session-token identifier | serialized session | `COOKIE_MAX_AGE` (touched on access) |
-| Redirect | lowercased `shortUrl` | `{ longUrl, isFile, safeBrowsingExpiry }` | `REDIRECT_EXPIRY` (default 300 s) |
-| Statistics | implementation-defined | implementation-defined | implementation-defined |
-| URL threat-scan | full URL | `{ threatTypes, expireTime }` | 300 s |
-
-The redirect cache MUST be invalidated on `Url` update. Implementations MAY use any cache technology (in-memory, key-value store, distributed cache). Caches MAY share an underlying storage technology so long as their key spaces and eviction policies remain independent.
-
-### 21.3 Object store
-
-- File-upload bucket: `AWS_S3_BUCKET`. Visibility toggled by `state` (§11). Object naming, ACL semantics, and storage-class choices are implementation-defined.
-- QR bulk output bucket: `BULK_GENERATION_BUCKET`. Public-readable. The bucket key for each artifact MUST be `${jobItemId}/${filename}` so the server-side polling endpoint can construct download URLs deterministically.
-
----
-
-## 22. Observability, Security, and Operations
-
-### 22.1 Logging
-
-Server logs MUST be structured (key-value or JSON) so that downstream log pipelines can index them. Log level SHOULD be configurable (e.g., `debug` in development, `info` in production). Choice of logging library is implementation-defined.
-
-HTTP request logging SHOULD record at minimum: method, path, HTTP version, status code, response size, referrer, user agent, response time, and the following extracted fields:
-
-- **Client IP**, derived from a forwarding header (e.g., `CF-Connecting-IP`, `X-Forwarded-For`) if present, otherwise the connection-level remote address.
-- **Redirect URL**: the `Location` header on 3xx responses.
-- **User ID**: the authenticated session's user id, or empty.
-
-### 22.2 Tracing and APM
-
-Application performance monitoring is OPTIONAL. When configured, the server SHOULD propagate trace context across HTTP boundaries, async-job dispatch, and the email transport, and SHOULD tag spans with the route name. Identification fields (`DD_SERVICE`, `DD_ENV`, or their analogues in the chosen platform) are implementation-defined.
-
-### 22.3 Real-user observability (client)
-
-Browser-side real-user monitoring is OPTIONAL. When configured, the client SHOULD identify the authenticated user to the platform on login.
-
-### 22.4 Metrics
-
-The server emits the metrics listed in Appendix C. The metrics MUST be named exactly as listed (the names form a stable observability contract). They MAY be emitted to any platform (StatsD, Prometheus, OpenTelemetry, vendor-specific). Tags on metrics MUST be preserved.
-
-### 22.5 HTTP security headers
+### 19.1 Content Security Policy
 
 The server MUST emit a Content-Security-Policy header restricting the origins from which the client may load scripts, styles, fonts, images, and connect targets. A conforming default-deny policy is:
 
 ```
 default-src 'self';
-style-src   'self' 'unsafe-inline' <web-font CDN>;
-font-src    'self' <web-font CDN>;
+style-src   'self' 'unsafe-inline' <web-font origin>;
+font-src    'self' <web-font origin>;
 img-src     'self' data: <web-analytics origin> <file-hosting origin>;
-script-src  'self' <web-analytics origin> <real-user-monitoring agent origin>;
+script-src  'self' <web-analytics origin>;
 worker-src  blob:;
-connect-src 'self' <web-analytics origin> <real-user-monitoring intake origin> [+ CSP_REPORT_URI if set];
+connect-src 'self' <web-analytics origin> [+ CSP_REPORT_URI if set];
 frame-ancestors 'self';
 upgrade-insecure-requests;
 ```
 
-Specific allow-listed origins depend on which external services (web analytics, real-user monitoring, file hosting, web-font provider) are configured.
+Allow-listed origins MUST be expanded to cover whichever external services (web analytics, file hosting, web-font provider, etc.) are configured. When `CSP_ONLY_REPORT_VIOLATIONS=true` the header MUST be sent as `Content-Security-Policy-Report-Only` instead.
 
-When `CSP_ONLY_REPORT_VIOLATIONS=true` the header MUST be sent as `Content-Security-Policy-Report-Only` instead.
-
-Additional headers (HSTS, X-Content-Type-Options, X-Frame-Options or equivalent) SHOULD be set per current web-security best practice; the existing implementation derives most of them from a helmet-style middleware.
+Additional baseline headers (HSTS, X-Content-Type-Options, X-Frame-Options, etc.) SHOULD be set per current web-security best practice.
 
 All responses MUST set `Cache-Control: no-store`.
 
-### 22.6 Rate Limiting
+### 19.2 Rate Limiting
 
-`POST /api/login/otp` MUST be rate-limited per client IP. Default window 60 s; default cap `OTP_RATE_LIMIT` requests per window (0 disables; default 0 in development). Overflowing requests MUST receive HTTP 429. Rate-limit overflow events SHOULD be logged at warning level.
-
-No other endpoints are rate-limited.
-
-### 22.7 Server timeouts
-
-The server MUST configure HTTP keep-alive and headers timeouts that are compatible with whichever load balancer fronts it (e.g., an L7 load balancer with a 100-second idle timeout requires the server's keep-alive to be lower than that). The existing deployment uses `keepAliveTimeout = 65 s` and `headersTimeout = 66 s`; a rewrite MAY pick any values that satisfy the load-balancer constraint.
-
-### 22.8 Error handler and not-found fallbacks
-
-The server MUST translate the following error classes into HTTP responses:
-
-- A schema-validation error from request input → HTTP 400 with the validation message in `{ message }`.
-- A malformed JSON request body → HTTP 400 with `{ message: 'Bad Request. JSON is malformed' }`.
-- Any other unhandled exception → HTTP 500 with an error page or JSON body. The response body format is implementation-defined.
-
-There are three not-found surfaces. Only one is part of the external contract (§27):
-
-1. **External REST API 404 (`/api/v1/...`)** — JSON body, e.g., `{ message: 'Resource not found.' }`. Integrators rely on the JSON content type; the body schema is implementation-defined.
-2. **Short-URL 404 (`GET /:shortUrl`)** — HTTP 404 from the redirect endpoint. The current implementation renders an HTML "link not found" page; a rewrite may render any HTML or JSON 404, so long as the status code is 404.
-3. **SPA / internal API 404** — any other path. The current implementation renders the same HTML template as surface 2; a rewrite may handle this however it likes.
-
-The process MUST install a global handler for unhandled promise rejections (or the equivalent in the chosen runtime) and emit the `ERROR_UNHANDLED_REJECTION` metric when one occurs.
-
-### 22.9 Health checks
-
-The server SHOULD expose a way for the surrounding infrastructure to determine its liveness. The mechanism (dedicated HTTP endpoint, TCP probe, process exit code) is implementation-defined.
+`POST /api/login/otp` MUST be rate-limited per client IP. Default window 60 s, default cap `OTP_RATE_LIMIT` requests per window (0 disables). Overflowing requests MUST receive HTTP 429. No other endpoints are rate-limited.
 
 ---
 
-## 23. Failure Model and Recovery
+## 20. Failure Model and Recovery
 
-### 23.1 Custom error classes
+### 20.1 Custom error classes
 
 | Class | HTTP | Source |
 |-------|------|--------|
@@ -1383,7 +978,7 @@ The server SHOULD expose a way for the surrounding infrastructure to determine i
 | `InvalidOtpError` | 401 | OTP mismatch (carries retries-left). |
 | `InvalidUrlUpdateError` | 400 | Disallowed update (e.g., file → URL). |
 
-### 23.2 Standard response
+### 20.2 Standard response
 
 ```
 { ok?: boolean, message: string, type?: MessageType }
@@ -1391,7 +986,7 @@ The server SHOULD expose a way for the surrounding infrastructure to determine i
 
 `MessageType` ∈ `{ 'ShortUrlError', 'LongUrlError', 'FileUploadError' }`.
 
-### 23.3 Status codes
+### 20.3 Status codes
 
 | Code | Meaning |
 |------|---------|
@@ -1407,7 +1002,7 @@ The server SHOULD expose a way for the surrounding infrastructure to determine i
 | 429 | OTP rate limit |
 | 500 | Mailer/db/scan/service failure |
 
-### 23.4 Partial-state recovery
+### 20.4 Partial-state recovery
 
 - Bulk creates run inside a single transaction; failures roll back fully. The CSV is not partially applied.
 - Job items are independent: a failed item MUST mark its parent job FAILURE on the next aggregation, but other items may have already produced object-store artifacts. The completion email MUST report the partial state.
@@ -1415,169 +1010,9 @@ The server SHOULD expose a way for the surrounding infrastructure to determine i
 
 ---
 
-## 24. Reference Algorithms
+## 21. Backward Compatibility (External Surfaces Only)
 
-### 24.1 Login OTP
-
-```
-on POST /api/login/otp:
-    rate_limit(ip)
-    validate(email)
-    otp = random6digit()
-    hash = bcrypt(otp, SALT_ROUNDS)
-    redis_otp.set(email+':'+ip, { hashedOtp: hash, retries: 3 }, ex=OTP_EXPIRY)
-    mailer.send_otp(email, otp, ip)
-    metric(OTP_GENERATE_SUCCESS)
-    return 200
-
-on POST /api/login/verify:
-    record = redis_otp.get(email+':'+ip)
-    if record is None: return 401
-    if bcrypt.compare(otp, record.hashedOtp):
-        user = users.find_or_create(email)
-        session.user = user
-        redis_otp.delete(email+':'+ip)
-        metric(OTP_VERIFY_SUCCESS)
-        return 200 { user }
-    record.retries -= 1
-    if record.retries > 0:
-        redis_otp.set(email+':'+ip, record, ex=remaining_ttl)
-        return 401 message="… ${record.retries} attempt(s) remaining."
-    redis_otp.delete(email+':'+ip)
-    return 401
-```
-
-### 24.2 Redirect
-
-```
-on GET /:shortUrl:
-    if not /^[a-zA-Z0-9-]+$/: return 404
-    dest = redis_redirect.get(shortUrl) or db_lookup(shortUrl)
-    if dest is None or dest.state == INACTIVE: return 404
-    fire_and_forget redis_redirect.set(shortUrl, dest, ex=REDIRECT_EXPIRY)
-
-    if not dest.isFile and (dest.safeBrowsingExpiry is None or expired):
-        if threat(dest.longUrl):
-            mark_inactive(shortUrl); email_owner(shortUrl); return 404
-        urls.update(shortUrl, safeBrowsingExpiry = now + 24h)
-
-    visits = update_cookie(req.cookies.visits, shortUrl)
-    direct = isCrawler(ua) or trustedReferrer(ref) or hasVisited(req.cookies.visits, shortUrl)
-
-    fire_and_forget recordClick(shortUrl, deviceClass(ua))
-    fire_and_forget ga_pageview(shortUrl, dest.longUrl, ua, ref) unless crawler
-
-    if direct: 302 Location=dest.longUrl
-    else:       render transition_page(escape(dest.longUrl), rootDomain, GA_TRACKING_ID)
-```
-
-### 24.3 Bulk Create
-
-```
-on POST /api/user/url/bulk:
-    csv = parse(csvBuffer, headerMustEqual=BULK_UPLOAD_HEADER)
-    if csv.errors: 400
-    for i, row in enumerate(csv.rows, 1):
-        if not validate_row(row, i, OG_URL.host): 400  # per §13.1.2
-    longUrls = csv.rows
-    if bulk_is_threat(longUrls): 400
-    mappings = [(generate_short_url(), u) for u in longUrls]
-    db.transaction(): bulk_insert_urls(mappings, tags, userId, source=BULK)
-    if ACTIVATE_BULK_QR_CODE_GENERATION:
-        job = jobs.create(userId)
-        for i, batch in enumerate(chunk(mappings, BULK_QR_CODE_BATCH_SIZE)):
-            jobItem = job_items.create(jobId=job.id, jobItemId=f"{job.uuid}/{i}", params={...})
-            jobQueue.enqueue(jobItem.params)
-        return 200 { count: len(mappings), job }
-    return 200 { count: len(mappings) }
-```
-
-### 24.4 Job Callback
-
-```
-on POST /api/callback/qr (admin API key):
-    item = job_items.find(jobItemId)
-    item.status = SUCCESS if status.isSuccess else FAILURE
-    item.message = status.errorMessage or ''
-    job = jobs.find(item.jobId)
-    job.status = compute_status(job.items)
-    if job.status != IN_PROGRESS:
-        mailer.send_job_completion(job)
-    return 200
-```
-
----
-
-## 25. Test and Validation Matrix
-
-A conforming implementation MUST cover the following test categories. Choice of test framework, runner, and harness is implementation-defined.
-
-### 25.1 Unit tests
-
-- All request-schema validators reject malformed inputs along the boundaries described in this document.
-- Pure validation helpers (URL, short-URL, tag, printable-ASCII, circular-redirect, blacklist) MUST be exercised against canonical positive and negative samples.
-- Pure aggregation helpers (`computeJobStatus`, `computeChangeSets`, cookie eviction, device-class classification) MUST be exercised against the spec examples.
-- Mappers between domain entities and DTOs MUST be covered.
-
-### 25.2 Integration tests
-
-Runs against a live stack containing the primary durable store, the caches, the object store, and the email transport (or stand-ins). MUST cover:
-
-- Full OTP login round-trip.
-- URL create / update / transfer / list.
-- Bulk upload with the async-job pipeline mocked or stubbed.
-- Redirect path including the URL threat-scan cache.
-- Audit endpoint pagination.
-
-### 25.3 End-to-end tests
-
-Runs against a headless browser hitting the deployed (or locally-orchestrated) stack. MUST cover the user stories of §3: login, create URL, edit, transfer, directory filter, transition page, link audit, API integration.
-
-### 25.4 Continuous Integration
-
-Lint + dependency audit + unit + integration + e2e MUST run on every push and pull request. Production deploys are triggered by an explicit release action.
-
----
-
-## 26. Implementation Checklist
-
-### 26.1 Required for conformance
-
-- [ ] All entities of §4 modelled with the documented attributes, constraints, and relationships.
-- [ ] All required env vars of §6.1 validated at startup with fail-fast.
-- [ ] Email allowlist enforced as the **intersection** of a glob match against `VALID_EMAIL_GLOB_EXPRESSION` and a structural email check.
-- [ ] OTP flow with per-IP rate limit, salted-hash storage, 3-retry semantics, and TTL eviction.
-- [ ] Session mechanism with strict same-site cookies.
-- [ ] API key flow with version-prefixed key strings and salted-hash suffix storage.
-- [ ] Content-Security-Policy header per §22.5 and `Cache-Control: no-store` everywhere.
-- [ ] Short URL CRUD with full URL/file/tag validation, automatic history writes, and redirect-cache invalidation.
-- [ ] Redirect path with cache, optional replica lookup, URL threat re-scan, transition page, fire-and-forget click recording, web-analytics hit.
-- [ ] Bulk upload pipeline per §13 including all eight row-level validators and the BULK_VALIDATION_ERROR metric tags.
-- [ ] QR endpoint with the layout and color rules of §14.
-- [ ] Link statistics endpoint with read-optimised access (replica reads when configured).
-- [ ] Link audit endpoint with the change-set algorithm of §16.2.
-- [ ] Directory search with weighted ranking and the `isEmail` mode rules of §17.2.
-- [ ] External and admin v1 API gated by `FF_EXTERNAL_API`.
-- [ ] All five error classes and the response shape of §23.2.
-
-### 26.2 Recommended extensions
-
-- [ ] Tracing, real-user observability, and metrics wired to the chosen observability platform.
-- [ ] One-command local development environment that stands up the durable store, caches, object store, email transport, and async-job queue.
-- [ ] Out-of-process workers for link migration, email-event capture, and bulk QR generation per Appendix A.
-
-### 26.3 Operational validation
-
-- [ ] OTP delivery verified end-to-end against a real transport in staging.
-- [ ] Replica failover behavior measured.
-- [ ] Bulk QR job processes a 1000-row CSV within the worker's wall-clock budget.
-- [ ] URL threat-scan outage soft-fails (or fails closed) per the configured `SAFE_BROWSING_LOG_ONLY` policy.
-
----
-
-## 27. Backward Compatibility (External Surfaces Only)
-
-### 27.1 Scope
+### 21.1 Scope
 
 GoGovSG is a long-lived public service, but only a small subset of its HTTP surface is consumed by third parties. A reimplementation MAY freely change everything *except* the surfaces that exist outside the system's own client. This section enumerates the externally-binding surfaces; **anything not listed here is implementation-defined and may be changed without notice.**
 
@@ -1590,7 +1025,7 @@ The externally-binding surfaces are:
 
 Everything else — the SPA-facing `/api/*` routes (login, user, qrcode, link-stats, link-audit, directory, callback), cookie names, session storage layout, response envelopes, HTML 404 templates, asset paths, log format, internal headers, the dual query/body parameter source on `GET /api/user/url`, the `hasApiKey` stringly-typed response — is **internal**. A rewrite SHOULD reach functional parity with these surfaces (so the SPA still works), but is free to change paths, methods, request shapes, response shapes, and status semantics. The SPA is part of the rewrite and may be updated in lockstep.
 
-### 27.2 Redirect endpoint (external)
+### 21.2 Redirect endpoint (external)
 
 `GET /{shortUrl}` MUST continue to be served at the deployment's production origin (configured via `OG_URL`, e.g. `https://go.gov.sg`).
 
@@ -1613,7 +1048,7 @@ Behaviors that are **not** part of the external contract and may change:
 - The internal mechanism (cache, replica, transition-page suppression cookie) used to compute the redirect.
 - Whether the transition page is shown at all, and the criteria for showing it.
 
-### 27.3 File-hosting URLs (external)
+### 21.3 File-hosting URLs (external)
 
 When a short link points to a hosted file, its `longUrl` MUST take the form:
 
@@ -1634,7 +1069,7 @@ Behaviors that may change:
 - The `Content-Type`, `Cache-Control`, and ACL semantics of the underlying object — as long as the URL remains fetchable by a browser.
 - The internal key format inside the storage backend, as long as the public URL is preserved.
 
-### 27.4 External REST API v1 (external)
+### 21.4 External REST API v1 (external)
 
 The `/api/v1/*` and `/api/v1/admin/*` namespaces are the documented integration surface for third parties. A reimplementation MUST preserve:
 
@@ -1643,9 +1078,9 @@ The `/api/v1/*` and `/api/v1/admin/*` namespaces are the documented integration 
   - `POST /api/v1/urls`
   - `PATCH /api/v1/urls/:shortUrl`
   - `POST /api/v1/admin/urls`
-- **Authentication scheme**: `Authorization: Bearer <apiKey>` (§8.2 / §27.5).
+- **Authentication scheme**: `Authorization: Bearer <apiKey>` (§6.2 / §21.5).
 - **Feature-flag gating**: when `FF_EXTERNAL_API` is disabled, these paths MUST return HTTP 404 (not 401). Integrators detect "API disabled" by 404.
-- **Request schema** for each route, as defined in §19. New optional fields MAY be added; required fields MUST NOT be added; existing required fields MUST NOT be removed.
+- **Request schema** for each route, as defined in §17. New optional fields MAY be added; required fields MUST NOT be added; existing required fields MUST NOT be removed.
 - **Response schema** for each route. The mapped `StorableUrl` returned by these endpoints is a stable, versioned DTO — it omits internal fields (`safeBrowsingExpiry`, `userId`) by design. Adding fields is safe; removing, renaming, or retyping fields is not.
 - **Status codes**: 200 on success, 400 on validation failure, 401 on missing/invalid API key, 404 when the feature is disabled or the resource is absent. Status semantics MUST NOT shift between these classes.
 
@@ -1656,7 +1091,7 @@ Implementation details that MAY change:
 - The on-disk representation of the URL record.
 - The presence of additional response fields beyond the documented schema.
 
-### 27.5 API key authentication (external)
+### 21.5 API key authentication (external)
 
 API keys issued by the current deployment MUST continue to authenticate after a rewrite. A key is the opaque string `${env}_${version}_${random}` returned once at generation time. To preserve this:
 
@@ -1666,7 +1101,7 @@ API keys issued by the current deployment MUST continue to authenticate after a 
 
 `API_KEY_VERSION` exists precisely to bracket this concern. Bumping the version (`v1` → `v2`) is a clean way to introduce a new format while continuing to verify old keys against the old format.
 
-### 27.6 Out of scope for backward compatibility
+### 21.6 Out of scope for backward compatibility
 
 The following are part of the rewrite's own design surface and MAY change freely:
 
@@ -1684,9 +1119,9 @@ The following are part of the rewrite's own design surface and MAY change freely
 | The morgan log format and StatsD metric names | Internal observability — a rewrite may emit different telemetry. |
 | HTML 404, 500 templates | Visual surface, free to redesign. |
 
-### 27.7 Removal policy for the External REST API
+### 21.7 Removal policy for the External REST API
 
-Because §27.4 is the only HTTP surface bound by an external versioning contract, removal of an `/api/v1/*` field follows this policy:
+Because §21.4 is the only HTTP surface bound by an external versioning contract, removal of an `/api/v1/*` field follows this policy:
 
 1. Introduce a new versioned namespace (`/api/v2/*`).
 2. Continue serving `/api/v1/*` for at least one quarter after the new version is announced.
@@ -1696,54 +1131,9 @@ Adding fields to existing `/api/v1/*` responses is non-breaking and requires no 
 
 ---
 
-## Appendix A. Out-of-process Workers
+## Appendix A. Validation Rules Reference
 
-Four logical workers complement the long-running server. Each describes a contract — input shape, side effects, output — rather than a concrete deployment artifact. Implementations MAY realise them as cloud functions, container jobs, in-process scheduled tasks, or any other mechanism, provided the contract is honored.
-
-### A.1 Migrate URL to user
-
-Input:
-
-```
-{ shortUrl: string, toUserEmail: string }
-```
-
-Behavior: reassign ownership of `shortUrl` to the user with the given email, creating the user if necessary. The operation MUST atomically update the URL's owner and emit a `UrlHistory` record. Returns `{ Status: "URL successfully migrated." }` on success; on error, fails with `"URL migration failed. ${error}"`.
-
-### A.2 Migrate user's links
-
-Input:
-
-```
-{ fromUserEmail: string, toUserEmail: string }
-```
-
-Behavior: reassign every URL owned by `fromUserEmail` to `toUserEmail`, creating the target user if necessary. The operation MUST atomically update ownership for every affected URL and emit a `UrlHistory` record per URL. Returns `{ Status: "URL successfully migrated. ${rowCount} rows affected" }` on success; fails with `"User links migration failed. ${error}"`.
-
-### A.3 Bulk QR code generation
-
-Triggered by an async-job-queue message of the form `{ jobItemId, mappings: [{shortUrl, longUrl}, …] }` (§13.2).
-
-Environment / configuration: a domain string used to build the human-readable short link encoded in each QR; the bulk-output object-store bucket; the callback endpoint URL and shared-secret bearer token.
-
-Steps:
-
-1. Build a CSV with header `Short URL,Original URL` and upload to `${jobItemId}/generated.csv`.
-2. For each `shortUrl`, render a branded QR per §14 as SVG, then collect all SVGs into a zip and upload to `${jobItemId}/generated_svg.zip`.
-3. Repeat as PNG → `${jobItemId}/generated_png.zip`.
-4. Notify the server via the configured callback with `Authorization: Bearer <shared secret>` and body `{ jobItemId, status: { isSuccess, errorMessage } }`.
-
-On any step failure, the callback MUST be sent with `isSuccess=false` and the error message. The worker MUST be safe under at-least-once delivery: re-running for the same `jobItemId` MUST overwrite the same artifact keys deterministically.
-
-### A.4 Email-delivery event capture
-
-If the chosen email transport publishes bounce, complaint, or delivery events, an auxiliary worker SHOULD subscribe to those events, identify the affected recipient address, mark it as undeliverable, and suppress future sends. The event format, subscription mechanism, and storage of suppression state are all implementation-defined.
-
----
-
-## Appendix B. Validation Rules Reference
-
-Quick reference for the rules in §7 and §12:
+Quick reference for the rules in §5 and §10:
 
 | Field | Pattern / Rule | Max length |
 |-------|----------------|------------|
@@ -1753,40 +1143,14 @@ Quick reference for the rules in §7 and §12:
 | `description` | printable ASCII | 200 |
 | `tag` (string) | `^[A-Za-z0-9_-]+$` | 25 |
 | tags per link | unique | 3 |
-| file extension | allowlist (§7.6) | — |
+| file extension | allowlist (§5.6) | — |
 | file size | ≤ 20 MiB | — |
 | CSV size | ≤ 5 MiB | — |
 | CSV rows | ≤ `BULK_UPLOAD_MAX_NUM` | — |
 
 ---
 
-## Appendix C. Metrics Reference
-
-All metrics MUST be prefixed `go.`. The metrics MAY be emitted as counters, gauges, histograms, or any other primitive supported by the observability platform; their names and tags are the stable contract.
-
-| Metric | Tags | Source |
-|--------|------|--------|
-| `apikey.generate` | `isnew:bool` | API key creation. |
-| `otp.generate.success` / `.failure` | — | `/api/login/otp`. |
-| `otp.verify.success` / `.failure` | — | `/api/login/verify`. |
-| `malicious_activity.file` | — | Antivirus positive. |
-| `malicious_activity.link` | — | URL threat-scan positive. |
-| `scan.file.failure` | — | Antivirus error. |
-| `scan.link.failure` | — | URL threat-scan error. |
-| `shortlink.clicks` | — | Redirect served. |
-| `shortlink.create` | `source:CONSOLE/API/BULK`, `isfile:bool` | URL creation. |
-| `user.new` | — | First-time user create. |
-| `bulk.validation.error` | `acceptableLinkCount`, `validHeader`, `onlyOneColumn`, `isNotEmpty`, `isValidUrl`, `isNotBlacklisted`, `isNotCircularRedirect`, `noParsingError` | Per-row failure. |
-| `bulk.hash.success` / `.failure` | — | Bulk persistence. |
-| `job.start.success` / `.failure` | — | Per-item job dispatch. |
-| `job.update.success` / `.failure` | — | Aggregate status recompute. |
-| `job.email.success` / `.failure` | — | Job completion email. |
-| `directory.search.domain` / `.email` | — | Directory queries. |
-| `error.unhandled_rejection` | — | Process-level handler. |
-
----
-
-## Appendix D. Locale Schema
+## Appendix B. Locale Schema
 
 The deployment ships exactly one English locale file. Its location and loading mechanism are implementation-defined. The key schema MUST be:
 
@@ -1828,51 +1192,50 @@ The locale loader is initialized for English only (no other languages are suppor
 
 ---
 
-## Appendix E. Public Surface Map
+## Appendix C. Public Surface Map
 
 A single-page index of every public HTTP route.
 
 Columns:
 - **Auth**: `S` = session required, `K` = API key required, `A` = admin role required, `–` = public.
-- **BC**: backward-compatibility class. **`E`** = externally-binding (third-party integrators, published links, or stored URLs in the wild depend on this route — see §27); **`I`** = internal (consumed only by the GoGovSG SPA or other rewritable surfaces; may be redesigned).
+- **BC**: backward-compatibility class. **`E`** = externally-binding (third-party integrators, published links, or stored URLs in the wild depend on this route — see §21); **`I`** = internal (consumed only by the GoGovSG SPA or other rewritable surfaces; may be redesigned).
 
 | Method | Route | Auth | BC | Section |
 |--------|-------|------|----|---------|
-| `GET` | `/:shortUrl` | – | **E** | §10, §27.2 |
-| `GET` | `/api/v1/urls` | K | **E** | §19.1, §27.4 |
-| `POST` | `/api/v1/urls` | K | **E** | §19.1, §27.4 |
-| `PATCH` | `/api/v1/urls/:shortUrl` | K | **E** | §19.1, §27.4 |
-| `POST` | `/api/v1/admin/urls` | K + A | **E** | §19.2, §27.4 |
-| `GET` | `/api/ga` | – | I | §15.4 |
-| `GET` | `/api/stats` | – | I | §15.1 |
-| `GET` | `/api/links` | – | I | §5, §18.3 |
-| `GET` | `/api/login/message` | – | I | §8.1 |
-| `GET` | `/api/login/emaildomains` | – | I | §8.1 |
-| `POST` | `/api/login/otp` | – (IP rate-limited) | I | §8.1 |
-| `POST` | `/api/login/verify` | – | I | §8.1 |
-| `GET` | `/api/login/isLoggedIn` | – | I | §8.1 |
-| `GET` | `/api/logout` | – | I | §8.3 |
-| `GET` | `/api/user/url` | S | I | §9.5 |
-| `POST` | `/api/user/url` | S | I | §9.1 |
-| `PATCH` | `/api/user/url` | S | I | §9.2 |
-| `PATCH` | `/api/user/url/ownership` | S | I | §9.3 |
-| `POST` | `/api/user/url/bulk` | S | I | §13.1 |
-| `GET` | `/api/user/tag` | S | I | §9.6 |
-| `POST` | `/api/user/apiKey` | S | I | §8.2 |
-| `GET` | `/api/user/hasApiKey` | S | I | §8.2 |
-| `GET` | `/api/user/message` | S | I | §6.3 |
-| `GET` | `/api/user/announcement` | S | I | §6.3 |
-| `GET` | `/api/user/job/latest` | S | I | §13.5 |
-| `GET` | `/api/user/job/status` | S | I | §13.5 |
-| `GET` | `/api/qrcode` | S | I | §14.1 |
-| `GET` | `/api/link-stats` | S | I | §15.2 |
-| `GET` | `/api/link-audit` | S | I | §16 |
-| `GET` | `/api/directory/search` | S | I | §17 |
-| `POST` | `/api/callback/qr` | K + A | I | §13.4 |
-| `GET` | `/assets/transition-page/js/redirect.js` | – | I | §10.1 |
-| `GET` | `/locales/en/translation.json` (or implementation-defined path) | – | I | §18.9 |
+| `GET` | `/:shortUrl` | – | **E** | §8, §21.2 |
+| `GET` | `/api/v1/urls` | K | **E** | §17.1, §21.4 |
+| `POST` | `/api/v1/urls` | K | **E** | §17.1, §21.4 |
+| `PATCH` | `/api/v1/urls/:shortUrl` | K | **E** | §17.1, §21.4 |
+| `POST` | `/api/v1/admin/urls` | K + A | **E** | §17.2, §21.4 |
+| `GET` | `/api/ga` | – | I | §13 |
+| `GET` | `/api/stats` | – | I | §13.1 |
+| `GET` | `/api/links` | – | I | §3, §16.3 |
+| `GET` | `/api/login/message` | – | I | §6.1 |
+| `GET` | `/api/login/emaildomains` | – | I | §6.1 |
+| `POST` | `/api/login/otp` | – (IP rate-limited) | I | §6.1 |
+| `POST` | `/api/login/verify` | – | I | §6.1 |
+| `GET` | `/api/login/isLoggedIn` | – | I | §6.1 |
+| `GET` | `/api/logout` | – | I | §6.3 |
+| `GET` | `/api/user/url` | S | I | §7.5 |
+| `POST` | `/api/user/url` | S | I | §7.1 |
+| `PATCH` | `/api/user/url` | S | I | §7.2 |
+| `PATCH` | `/api/user/url/ownership` | S | I | §7.3 |
+| `POST` | `/api/user/url/bulk` | S | I | §11.1 |
+| `GET` | `/api/user/tag` | S | I | §7.6 |
+| `POST` | `/api/user/apiKey` | S | I | §6.2 |
+| `GET` | `/api/user/hasApiKey` | S | I | §6.2 |
+| `GET` | `/api/user/message` | S | I | §4 |
+| `GET` | `/api/user/announcement` | S | I | §4 |
+| `GET` | `/api/user/job/latest` | S | I | §11.3 |
+| `GET` | `/api/user/job/status` | S | I | §11.3 |
+| `GET` | `/api/qrcode` | S | I | §12.1 |
+| `GET` | `/api/link-stats` | S | I | §13.2 |
+| `GET` | `/api/link-audit` | S | I | §14 |
+| `GET` | `/api/directory/search` | S | I | §15 |
+| `GET` | `/assets/transition-page/js/redirect.js` | – | I | §8.1 |
+| `GET` | `/locales/en/translation.json` (or implementation-defined path) | – | I | §16.8 |
 
-A rewrite that wishes to remain compatible with deployed links and existing API integrations need only preserve the **E**-class rows of this table (plus the file URL shape of §27.3 and the API key verification rules of §27.5). All **I**-class rows may be redesigned, removed, or replaced; the SPA must be updated in lockstep.
+A rewrite that wishes to remain compatible with deployed links and existing API integrations need only preserve the **E**-class rows of this table (plus the file URL shape of §21.3 and the API key verification rules of §21.5). All **I**-class rows may be redesigned, removed, or replaced; the SPA must be updated in lockstep.
 
 ---
 
